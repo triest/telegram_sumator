@@ -178,8 +178,9 @@ def _kw_hits(text_low, keywords):
 _PROMPT = (
     "Ты классификатор постов Telegram. Темы:\n{topics}\n\n"
     "Канал: {channel}\nПост:\n{text}\n\n"
-    "Выбери ОДНУ тему, к которой пост действительно относится по смыслу. "
-    "Если ни одна не подходит — ответь: нет. Ответь только названием темы."
+    "Выбери ОДНУ тему, только если она — ГЛАВНЫЙ предмет поста. Реклама, розыгрыши, шутки, "
+    "побочные упоминания и другие сферы — ответь: нет. При сомнении — нет. "
+    "Ответь только названием темы."
 )
 
 
@@ -310,6 +311,15 @@ async def _scan(settings, helper):
                 if p["score"] >= threshold:
                     p.update(topic=guess, engine="emb")
                     result.append(p)
+
+    # posts that matched nothing go to a separate group (newest 100, no images)
+    if topics:
+        accepted = {id(p) for p in result}
+        others = sorted((p for p in posts if id(p) not in accepted), key=lambda p: -p["date"])[:100]
+        for p in others:
+            p.update(topic="Прочее (не подошло)", engine="")
+            p["has_photo"] = p["has_video"] = False
+            result.append(p)
 
     # thumbnails for accepted posts
     if images:

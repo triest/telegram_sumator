@@ -66,7 +66,10 @@ def resolve_device(requested: str = "auto") -> str:
         return "cpu"
 
     try:
+        logger.info("Загрузка PyTorch…")
         import torch
+
+        logger.info("PyTorch загружен, проверяю GPU…")
     except ImportError:
         if requested == "cuda":
             raise RuntimeError("torch is not installed; cannot use device='cuda'.")
@@ -350,6 +353,32 @@ class LLMTopicVerifier:
         self._topics = [(t.name, list(t.keywords)) for t in topics]
         self._example_by_name = {t.name: t.as_example() for t in topics}
         self._borderline = max(0.2, threshold - 0.15)
+        # True: the local LLM classifies EVERY post (embeddings/keywords only
+        # serve as fallback if the LLM is unavailable).
+        self.llm_primary = True
+        self.vision_model = ""
+        try:
+            from llm import find_vision_model
+
+            self.vision_model = find_vision_model(url)
+        except Exception:
+            pass
+        if self.vision_model:
+            logger.info("Анализ картинок включён: модель %s", self.vision_model)
+            if self.vision_model != self.model:
+                # Two different 7B models don't fit in VRAM together: Ollama would
+                # unload/reload them on every alternating request (-> timeouts).
+                # The vision model reads text just as well, so use ONE model.
+                logger.info(
+                    "Использую одну модель %s и для текста, и для картинок (без перезагрузок "
+                    "между моделями)", self.vision_model,
+                )
+                self.model = self.vision_model
+        else:
+            logger.info(
+                "Модель для картинок не найдена (ollama pull qwen2.5vl:7b) — посты без текста "
+                "относятся по тематике канала"
+            )
         self._cache: dict[int, Optional[str]] = {}
         self._failures = 0
         self.stats = {"calls": 0, "cached": 0, "accepted": 0, "rejected": 0}
@@ -371,20 +400,55 @@ class LLMTopicVerifier:
         fn = getattr(self.base, "topic_matrix", None)
         return fn(texts) if fn else None
 
+    def _lean(self, prior):
+        """(topic name, strength) the channel is mostly about, or (None, 0)."""
+        if prior is None or len(prior) == 0:
+            return None, 0.0
+        n = min(len(self._topics), len(prior))
+        if n == 0:
+            return None, 0.0
+        i = max(range(n), key=lambda k: float(prior[k]))
+        return self._topics[i][0], float(prior[i])
+
     def _hint(self, prior, channel_title: str) -> str:
         parts = []
         if channel_title:
             parts.append(f"канал «{channel_title}»")
         if prior is not None:
-            n = len(self._topics)
+            n = min(len(self._topics), len(prior))
             leaning = [
                 self._topics[i][0]
                 for i in sorted(range(n), key=lambda i: -float(prior[i]))
-                if i < len(prior) and float(prior[i]) > 0.03
+                if float(prior[i]) > 0.03
             ][:2]
             if leaning:
                 parts.append("обычно публикует про: " + ", ".join(leaning))
+            name, strength = self._lean(prior)
+            if name and strength >= 0.08:
+                parts.append(f"это тематический канал, в основном про «{name}»")
         return "; ".join(parts)
+
+    def _classify_image(self, path: str, caption: str, hint: str):
+        from llm import classify_image
+
+        key = hash(("img", path, caption, hint))
+        if key in self._cache:
+            self.stats["cached"] += 1
+            return True, self._cache[key]
+        if self._failures >= 8:
+            return False, None
+        try:
+            topic = classify_image(
+                path, self._topics, self.vision_model, self.url, hint=hint, caption=caption
+            )
+        except Exception as e:
+            self._failures += 1
+            logger.warning("Анализ картинки не удался (%s)", e)
+            return False, None
+        self.stats["calls"] += 1
+        self._failures = 0  # only CONSECUTIVE failures disable the LLM
+        self._cache[key] = topic
+        return True, topic
 
     def _classify(self, text: str, hint: str = ""):
         from llm import classify_topic
@@ -393,7 +457,7 @@ class LLMTopicVerifier:
         if key in self._cache:
             self.stats["cached"] += 1
             return True, self._cache[key]
-        if self._failures >= 5:  # LLM is down: stop hammering it this session
+        if self._failures >= 8:  # LLM is down: stop hammering it this session
             return False, None
         try:
             topic = classify_topic(text, self._topics, self.model, self.url, hint=hint)
@@ -402,22 +466,55 @@ class LLMTopicVerifier:
             logger.warning("ИИ-проверка не удалась (%s), использую быстрый фильтр", e)
             return False, None
         self.stats["calls"] += 1
+        self._failures = 0  # only CONSECUTIVE failures disable the LLM
         self._cache[key] = topic
         return True, topic
 
     def score_batch(
         self, texts: list[str], prior=None, channel_title: str = "", **kw
     ) -> list[FilterResult]:
+        images = kw.pop("images", None)
         results = self.base.score_batch(texts, prior=prior, **kw)
         hint = self._hint(prior, channel_title)
+        lean_name, lean_strength = self._lean(prior)
+        # In a clearly thematic channel even weakly-matching posts are worth a
+        # look by the LLM (the channel's subject is the context).
+        _, strength = self._lean(prior)
+        border = min(self._borderline, 0.10) if strength >= 0.08 else self._borderline
+        if self.llm_primary:
+            border = 0.0  # the LLM decides the category for every post
         out = []
-        for text, res in zip(texts, results):
-            if res.score < self._borderline or not text.strip():
-                out.append(FilterResult(is_relevant=False, score=res.score, matched_example=res.matched_example))
+        for idx, (text, res) in enumerate(zip(texts, results)):
+            img = images[idx] if images and idx < len(images) else None
+            if img and len(text.strip()) < 40 and self.vision_model:
+                # picture (+ short caption) judged by the local vision model
+                okv, topic = self._classify_image(img, text, hint)
+                if okv:
+                    if topic:
+                        self.stats["accepted"] += 1
+                        out.append(FilterResult(True, 0.7, self._example_by_name.get(topic, res.matched_example), "ИИ-фото"))
+                    else:
+                        self.stats["rejected"] += 1
+                        out.append(FilterResult(False, min(res.score, 0.3), res.matched_example, "ИИ-нет"))
+                    continue
+            if not text.strip():
+                # nothing to read: fall back to the channel's usual subject
+                if lean_name and lean_strength >= 0.08:
+                    out.append(FilterResult(True, 0.5, self._example_by_name.get(lean_name), "канал"))
+                else:
+                    out.append(res)
+                continue
+            if not self.llm_primary and res.score < border:
+                out.append(res)  # too short for the LLM: embeddings/keywords decide
                 continue
             ok, topic = self._classify(text, hint)
             if not ok:
                 out.append(res)  # LLM unavailable: keep the fast verdict
+            elif topic is None and res.is_relevant and res.score >= self.threshold + 0.08:
+                # The LLM said "none", but embeddings/keywords are clearly
+                # confident: both engines look at every post, either can add it.
+                self.stats["rescued"] = self.stats.get("rescued", 0) + 1
+                out.append(FilterResult(True, res.score, res.matched_example, "смысл"))
             elif topic is None:
                 self.stats["rejected"] += 1
                 out.append(FilterResult(is_relevant=False, score=min(res.score, 0.3), matched_example=res.matched_example, source="ИИ-нет"))

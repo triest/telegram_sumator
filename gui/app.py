@@ -43,7 +43,7 @@ from config import PROJECT_ROOT  # noqa: E402
 LOG_PATH = PROJECT_ROOT / "digest.log"
 
 POLL_INTERVAL_MS = 300
-MAX_FEED_ITEMS = 200
+MAX_FEED_ITEMS = 400
 ALL_TOPICS = "Все темы"
 OTHER_TOPIC = "Прочее (не подошло)"
 
@@ -109,93 +109,256 @@ def _chip(master, text: str, fg, text_color=TEXT_ON_CHIP, size: int = 12):
 
 
 class PostCard(ctk.CTkFrame):
-    """One post: channel/time, picture, topic + engine chips, the FULL text,
-    open-in-Telegram button."""
+    """Compact digest card.
+
+    Collapsed (default): small square thumbnail + channel/time + the first
+    lines of the post. Click anywhere on the card to expand: full text with
+    clickable links and a larger picture; click the picture to see it
+    full-size. Short text-only posts have nothing to expand."""
+
+    SNIPPET = 230
+    THUMB = 104
 
     def __init__(self, master, scored: ScoredPost) -> None:
         super().__init__(
             master,
-            corner_radius=14,
+            corner_radius=12,
             fg_color=("white", "#1c2230"),
             border_width=1,
             border_color=("#e3e7ee", "#2c3446"),
         )
         self.scored = scored
         self.topic = topic_label(scored)
-        post = scored.post
-        self._image = None  # keep a reference so Tk doesn't drop the picture
+        self._post = scored.post
+        self._text_full = self._post.text.strip() or "(без текста, только картинка)"
+        self._has_img = bool(
+            getattr(self._post, "image_path", None) and os.path.exists(self._post.image_path)
+        )
+        self._expandable = self._has_img or len(self._text_full) > self.SNIPPET or self._text_full.count("\n") > 3
+        self._expanded = False
+        self._link_click = False
+        self._refs = []  # keep CTkImage objects alive
+        self._wrap = 560
+        self._body_label = None
+        self._built = False
+        self._title, self._rest = self._split_title(self._text_full)
+        self.grid_columnconfigure(1, weight=1)
+        self.bind("<Configure>", self._on_resize)
 
-        self.grid_columnconfigure(0, weight=1)
+    # Cards are built lazily (first time they are shown): hundreds of cards
+    # with ~10 widgets each would make the window sluggish and glitchy.
+    def ensure_built(self) -> None:
+        if not self._built:
+            self._built = True
+            self._render()
 
-        # -- header: channel, time, score ------------------------------
+    def pack(self, *a, **kw):
+        self.ensure_built()
+        super().pack(*a, **kw)
+
+    @classmethod
+    def _split_title(cls, text: str):
+        """(title, rest): the first line is a title when it is short and the
+        post has more text after it (typically a **bold** headline)."""
+        lines = [ln for ln in text.strip().splitlines()]
+        if not lines:
+            return "", text
+        first = cls._plain(lines[0])
+        rest = "\n".join(lines[1:]).strip()
+        if first and rest and len(first) <= 140:
+            return first, rest
+        return "", text
+
+    # ------------------------------------------------------------ helpers
+    @staticmethod
+    def _plain(text: str) -> str:
+        t = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1", text)
+        t = t.replace("**", "").replace("__", "").replace("`", "")
+        return " ".join(t.split())
+
+    def _snippet(self) -> str:
+        t = self._plain(self._rest if self._title else self._text_full)
+        return t if len(t) <= self.SNIPPET else t[: self.SNIPPET].rstrip() + "…"
+
+    def _clear(self) -> None:
+        for w in self.winfo_children():
+            w.destroy()
+        self._refs = []
+        self._body_label = None
+
+    def _toggle(self, _e=None) -> None:
+        if not self._expandable:
+            return
+        if self._link_click:
+            self._link_click = False
+            return
+        self._expanded = not self._expanded
+        self._render()
+
+    def _open_link(self, url: str) -> None:
+        self._link_click = True
+        webbrowser.open(url)
+
+    def _bind_click(self, widget) -> None:
+        widget.bind("<Button-1>", self._toggle)
+        if self._expandable:
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
+
+    def _thumb(self, size: int):
+        from PIL import Image, ImageOps
+
+        img = Image.open(self._post.image_path).convert("RGB")
+        img = ImageOps.fit(img, (size, size), Image.LANCZOS)
+        ci = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+        self._refs.append(ci)
+        return ci
+
+    def _big(self, max_w: int = 640, max_h: int = 420):
+        from PIL import Image
+
+        img = Image.open(self._post.image_path).convert("RGB")
+        w, h = img.size
+        scale = min(max_w / w, max_h / h, 1.0)
+        size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        ci = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+        self._refs.append(ci)
+        return ci
+
+    def _show_full_image(self, _e=None) -> None:
+        try:
+            from PIL import Image
+
+            top = ctk.CTkToplevel(self)
+            top.title(self._post.channel_title or "Картинка")
+            sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+            img = Image.open(self._post.image_path).convert("RGB")
+            w, h = img.size
+            scale = min((sw * 0.9) / w, (sh * 0.85) / h)
+            size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            ci = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+            lab = ctk.CTkLabel(top, image=ci, text="", cursor="hand2")
+            lab.image = ci
+            lab.pack(padx=6, pady=6)
+            top.geometry(f"{size[0] + 12}x{size[1] + 12}+{(sw - size[0]) // 2}+{max(0, (sh - size[1]) // 2 - 20)}")
+            for w_ in (top, lab):
+                w_.bind("<Button-1>", lambda _e: top.destroy())
+            top.bind("<Escape>", lambda _e: top.destroy())
+            top.after(150, top.focus_force)
+        except Exception:
+            logger.debug("Не удалось показать картинку", exc_info=True)
+
+    # ------------------------------------------------------------ render
+    def _render(self) -> None:
+        self._clear()
+        post, scored = self._post, self.scored
+        col_body = 1 if (self._has_img and not self._expanded) else 0
+        span = 1 if col_body else 2
+        pad_l = 10
+
+        if self._has_img and not self._expanded:
+            try:
+                tl = ctk.CTkLabel(self, image=self._thumb(self.THUMB), text="")
+                tl.grid(row=0, column=0, rowspan=5, padx=(10, 0), pady=10, sticky="n")
+                self._bind_click(tl)
+            except Exception:
+                self._has_img = False
+                col_body, span = 0, 2
+
+        # header: CHANNEL (always) . time . score
         head = ctk.CTkFrame(self, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        head.grid(row=0, column=col_body, columnspan=span, sticky="ew", padx=(12, 12), pady=(10, 0))
         head.grid_columnconfigure(0, weight=1)
+        chan = post.channel_title or (f"@{post.channel_username}" if post.channel_username else "Канал")
         title = ctk.CTkLabel(
             head,
-            text=post.channel_title or "Канал",
+            text=f"{chan}   ·   {post.date:%d.%m %H:%M}",
             anchor="w",
-            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=("#1a56c4", "#8ab4ff"),
+            font=ctk.CTkFont(size=13, weight="bold"),
         )
         title.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            head,
-            text=f"{post.date:%d.%m.%Y %H:%M}",
-            anchor="w",
-            text_color="gray",
-            font=ctk.CTkFont(size=12),
-        ).grid(row=1, column=0, sticky="w")
+        self._bind_click(title)
         _chip(
-            head,
-            f"{scored.result.score:.2f}",
-            fg=self._score_color(scored.result.score),
-            text_color="white",
-        ).grid(row=0, column=1, rowspan=2, sticky="e")
+            head, f"{scored.result.score:.2f}", fg=self._score_color(scored.result.score),
+            text_color="white", size=11,
+        ).grid(row=0, column=1, sticky="e")
+        self._bind_click(head)
+        if self._title:
+            tl2 = ctk.CTkLabel(
+                self, text=self._title, anchor="w", justify="left", wraplength=self._wrap,
+                font=ctk.CTkFont(size=15, weight="bold"),
+            )
+            tl2.grid(row=1, column=col_body, columnspan=span, sticky="ew", padx=12, pady=(2, 0))
+            self._title_label = tl2
+            self._bind_click(tl2)
+        else:
+            self._title_label = None
 
-        row = 1
-        # -- picture ------------------------------------------------------
-        img_label = self._make_image(post)
-        if img_label is not None:
-            img_label.grid(row=row, column=0, padx=16, pady=(2, 8), sticky="ew")
-            row += 1
+        if not self._expanded:
+            lab = ctk.CTkLabel(
+                self, text=self._snippet(), anchor="nw", justify="left",
+                wraplength=self._wrap, font=ctk.CTkFont(size=13),
+            )
+            lab.grid(row=2, column=col_body, columnspan=span, sticky="ew", padx=12, pady=(2, 4))
+            self._body_label = lab
+            self._bind_click(lab)
+        else:
+            if self._has_img:
+                try:
+                    il = ctk.CTkLabel(self, image=self._big(), text="", cursor="hand2")
+                    il.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 6))
+                    il.bind("<Button-1>", self._show_full_image)
+                except Exception:
+                    pass
+            tx = self._make_text(self, self._text_full if not self._title else self._rest)
+            tx.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+            self._text = tx
 
-        # -- chips: topic + engine ------------------------------------------
-        chips = ctk.CTkFrame(self, fg_color="transparent")
-        chips.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
-        _chip(chips, _short(self.topic, 40), fg=topic_color(self.topic)).pack(side="left")
+        # footer: chips + buttons
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.grid(row=4, column=col_body, columnspan=span, sticky="ew", padx=12, pady=(2, 10))
+        foot.grid_columnconfigure(10, weight=1)
+        c = 0
+        _chip(foot, _short(self.topic, 28), fg=topic_color(self.topic), size=11).grid(row=0, column=c)
+        c += 1
         src = {
-            "ИИ": "проверено ИИ",
-            "слова": "по словам",
-            "смысл": "по смыслу",
+            "ИИ": "ИИ", "ИИ-фото": "ИИ по картинке", "слова": "слова",
+            "смысл": "смысл", "канал": "по теме канала",
         }.get(scored.result.source, "")
         if src:
-            _chip(
-                chips, src, fg=("#eef1f6", "#2a3244"), text_color=("#4b5563", "#9aa5b8"), size=11
-            ).pack(side="left", padx=(6, 0))
+            _chip(foot, src, fg=("#eef1f6", "#2a3244"), text_color=("#4b5563", "#9aa5b8"), size=11).grid(
+                row=0, column=c, padx=(6, 0)
+            )
+            c += 1
         if post.has_video:
-            _chip(
-                chips, "видео", fg=("#eef1f6", "#2a3244"), text_color=("#4b5563", "#9aa5b8"), size=11
-            ).pack(side="left", padx=(6, 0))
-        row += 1
-
-        # -- the whole post text (selectable, clickable links, **bold**) ----
-        full_text = post.text.strip() or "(пост без текста)"
-        self._text = self._make_text(full_text)
-        self._text.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 8))
-        row += 1
-
+            _chip(foot, "видео", fg=("#eef1f6", "#2a3244"), text_color=("#4b5563", "#9aa5b8"), size=11).grid(
+                row=0, column=c, padx=(6, 0)
+            )
+            c += 1
+        if self._expandable:
+            ctk.CTkButton(
+                foot, text="Свернуть ▴" if self._expanded else "Подробнее ▾", width=90, height=24,
+                corner_radius=8, fg_color="transparent", hover_color=("#eef1f6", "#2a3244"),
+                text_color=("#1a56c4", "#8ab4ff"), command=self._toggle,
+            ).grid(row=0, column=10, sticky="e")
         ctk.CTkButton(
-            self,
-            text="Открыть в Telegram  ↗",
-            height=32,
-            width=180,
-            corner_radius=10,
-            fg_color=("#e8f0fe", "#243049"),
-            hover_color=("#d6e4fd", "#2f3f60"),
-            text_color=("#1a56c4", "#8ab4ff"),
-            command=lambda: webbrowser.open(post.link),
-        ).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+            foot, text="Открыть в Telegram ↗", width=150, height=24, corner_radius=8,
+            fg_color=("#e8f0fe", "#243049"), hover_color=("#d6e4fd", "#2f3f60"),
+            text_color=("#1a56c4", "#8ab4ff"), command=lambda: webbrowser.open(post.link),
+        ).grid(row=0, column=11, padx=(6, 0), sticky="e")
+        self._bind_click(foot)
 
+    def _on_resize(self, event) -> None:
+        wrap = max(240, event.width - (self.THUMB + 60 if (self._has_img and not self._expanded) else 40))
+        if abs(wrap - self._wrap) > 12:
+            self._wrap = wrap
+            if self._body_label is not None:
+                self._body_label.configure(wraplength=wrap)
+            if getattr(self, "_title_label", None) is not None:
+                self._title_label.configure(wraplength=wrap)
 
     _MD = re.compile(
         r"\[([^\]]+)\]\((https?://[^)\s]+)\)"   # [text](url)
@@ -206,7 +369,7 @@ class PostCard(ctk.CTkFrame):
         re.S,
     )
 
-    def _make_text(self, text: str):
+    def _make_text(self, parent, text: str):
         import tkinter as tk
 
         mode = ctk.get_appearance_mode()
@@ -215,7 +378,7 @@ class PostCard(ctk.CTkFrame):
         fg = "#e6eaf2" if dark else "#1f2937"
         link = "#6cb6ff" if dark else "#1a56c4"
         w = tk.Text(
-            self, wrap="word", bd=0, highlightthickness=0, relief="flat",
+            parent, wrap="word", bd=0, highlightthickness=0, relief="flat",
             bg=bg, fg=fg, insertwidth=0, height=1, width=10, padx=0, pady=0,
             font=("Segoe UI", 11), cursor="arrow", spacing1=1, spacing3=3,
         )
@@ -247,7 +410,7 @@ class PostCard(ctk.CTkFrame):
                 n += 1
                 name = f"u{n}"
                 w.tag_add(name, start, "end-1c")
-                w.tag_bind(name, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
+                w.tag_bind(name, "<Button-1>", lambda _e, u=url: self._open_link(u))
                 w.tag_bind(name, "<Enter>", lambda _e: w.configure(cursor="hand2"))
                 w.tag_bind(name, "<Leave>", lambda _e: w.configure(cursor="arrow"))
         w.insert("end", text[pos:])
@@ -257,37 +420,17 @@ class PostCard(ctk.CTkFrame):
                 return None
             return "break"
         w.bind("<Key>", _block)
-        w.bind("<Configure>", lambda _e: self._fit_text())
+        w.bind("<Configure>", lambda _e, _w=w: self._fit_text(_w))
         return w
 
-    def _fit_text(self) -> None:
+    def _fit_text(self, w) -> None:
         try:
-            lines = self._text.count("1.0", "end", "displaylines")
+            lines = w.count("1.0", "end", "displaylines")
             n = int(lines[0]) if lines else 1
-            if int(self._text.cget("height")) != max(1, n):
-                self._text.configure(height=max(1, n))
+            if int(w.cget("height")) != max(1, n):
+                w.configure(height=max(1, n))
         except Exception:
             pass
-
-    def _make_image(self, post):
-        path = getattr(post, "image_path", None)
-        if not path or not os.path.exists(path):
-            return None
-        try:
-            from PIL import Image
-
-            img = Image.open(path)
-            w, h = img.size
-            # as wide as the card allows, up to a sensible height
-            scale = min(860 / w, 560 / h)
-            size = (max(1, int(w * scale)), max(1, int(h * scale)))
-            self._image = ctk.CTkImage(light_image=img, dark_image=img, size=size)
-            label = ctk.CTkLabel(self, image=self._image, text="", cursor="hand2")
-            label.bind("<Button-1>", lambda _e: webbrowser.open(post.link))
-            return label
-        except Exception:
-            logger.debug("Не удалось показать картинку %s", path, exc_info=True)
-            return None
 
     @staticmethod
     def _score_color(score: float) -> str:
@@ -697,7 +840,8 @@ class DigestApp(ctk.CTk):
         )
         logging.getLogger().addHandler(handler)
         self._asking = False
-        self._collapsed: set[str] = set()
+        self._collapsed: set[str] = {OTHER_TOPIC}
+        self._group_limit: dict[str, int] = {}
         self._summaries: dict[str, str] = {}
         self._summarizing: set[str] = set()
         self._llm_results: "queue.Queue[tuple[str, str, bool]]" = queue.Queue()
@@ -727,6 +871,7 @@ class DigestApp(ctk.CTk):
         self.tray.start()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._bind_scroll_keys()
 
         self._refresh_topic_menu()
         self.worker.start()
@@ -833,6 +978,8 @@ class DigestApp(ctk.CTk):
             (c.scored.post.channel_id, c.scored.post.message_id) for c in self._feed_cards
         }
         new_posts = []
+        # irrelevant first: each card is inserted at the top, so relevant ones end up above them
+        posts = sorted(posts, key=lambda s: s.result.is_relevant)
         for scored in posts:
             key = (scored.post.channel_id, scored.post.message_id)
             if key in existing:
@@ -845,13 +992,55 @@ class DigestApp(ctk.CTk):
                 self._topics.append(card.topic)
 
         # Cap total cards kept; drop the oldest ones beyond the limit.
-        for card in self._feed_cards[MAX_FEED_ITEMS:]:
-            card.destroy()
-        self._feed_cards = self._feed_cards[:MAX_FEED_ITEMS]
+        # (relevant cards and the 'Прочее' ones are capped separately, otherwise
+        # a big pile of relevant posts pushes all 'Прочее' cards out)
+        rel_cards = [c for c in self._feed_cards if c.topic != OTHER_TOPIC]
+        oth_cards = [c for c in self._feed_cards if c.topic == OTHER_TOPIC]
+        keep = set(map(id, rel_cards[:MAX_FEED_ITEMS])) | set(map(id, oth_cards[:100]))
+        for card in self._feed_cards:
+            if id(card) not in keep:
+                card.destroy()
+        self._feed_cards = [c for c in self._feed_cards if id(c) in keep]
 
         self._refresh_topic_menu()
         self._render_feed()
         return new_posts
+
+    def _bind_scroll_keys(self) -> None:
+        """Keyboard scrolling of the feed: arrows, PgUp/PgDn, Space, Home/End,
+        and j/k. Active on the 'Лента' tab, never while typing in a field."""
+        def scroll(kind, amount):
+            def handler(event=None):
+                try:
+                    if self.tabview.get() != "Лента":
+                        return None
+                    w = self.focus_get()
+                    cls = w.winfo_class() if w is not None else ""
+                    if cls in ("Entry", "TEntry", "Text", "TCombobox") and kind != "page":
+                        return None
+                    canvas = self.feed_frame._parent_canvas
+                    if kind == "units":
+                        canvas.yview_scroll(amount, "units")
+                    elif kind == "page":
+                        canvas.yview_scroll(amount, "pages")
+                    elif kind == "home":
+                        canvas.yview_moveto(0.0)
+                    elif kind == "end":
+                        canvas.yview_moveto(1.0)
+                except Exception:
+                    return None
+                return "break"
+            return handler
+
+        binds = {
+            "<Up>": ("units", -3), "<Down>": ("units", 3),
+            "<k>": ("units", -3), "<j>": ("units", 3),
+            "<Prior>": ("page", -1), "<Next>": ("page", 1),
+            "<space>": ("page", 1), "<Shift-space>": ("page", -1),
+            "<Home>": ("home", 0), "<End>": ("end", 0),
+        }
+        for key, (kind, amount) in binds.items():
+            self.bind_all(key, scroll(kind, amount))
 
     def _refresh_topic_menu(self) -> None:
         configured = [t.name for t in self.config.topics]
@@ -864,6 +1053,26 @@ class DigestApp(ctk.CTk):
 
     def _on_topic_selected(self, _choice: str) -> None:
         self._render_feed()
+
+    GROUP_PAGE = 20
+
+    def _pack_limited(self, key: str, cards: list) -> None:
+        """Show the first N cards of a group, with a 'show more' button."""
+        limit = self._group_limit.get(key, self.GROUP_PAGE)
+        for card in cards[:limit]:
+            card.pack(fill="x", padx=6, pady=4)
+        if len(cards) > limit:
+            def more(k=key):
+                self._group_limit[k] = self._group_limit.get(k, self.GROUP_PAGE) + self.GROUP_PAGE
+                self._render_feed()
+
+            btn = ctk.CTkButton(
+                self.feed_frame, text=f"Показать ещё ({len(cards) - limit})", height=30,
+                fg_color=("#e8f0fe", "#243049"), hover_color=("#d6e4fd", "#2f3f60"),
+                text_color=("#1a56c4", "#8ab4ff"), command=more,
+            )
+            btn.pack(pady=6)
+            self._group_widgets.append(btn)
 
     def _render_feed(self) -> None:
         """Feed layout. "Все темы": posts grouped into collapsible topic
@@ -880,8 +1089,7 @@ class DigestApp(ctk.CTk):
         if selected != ALL_TOPICS:
             cards = [c for c in self._feed_cards if c.topic == selected]
             cards.sort(key=lambda c: c.scored.result.score, reverse=True)
-            for card in cards:
-                card.pack(fill="x", padx=6, pady=5)
+            self._pack_limited(selected, cards)
             self.feed_count_label.configure(text=f"Постов: {len(cards)} из {total}")
             return
 
@@ -904,7 +1112,7 @@ class DigestApp(ctk.CTk):
                 text=f"{'▶' if collapsed else '▼'}  {_short(topic, 60)}  ({len(cards)})",
                 anchor="w",
                 fg_color="transparent",
-                hover_color=("#00000015", "#ffffff18"),
+                hover_color=("#d8dde6", "#2c3446"),
                 text_color=TEXT_ON_CHIP,
                 font=ctk.CTkFont(size=15, weight="bold"),
                 command=lambda t=topic: self._toggle_group(t),
@@ -932,8 +1140,7 @@ class DigestApp(ctk.CTk):
                 lbl.pack(fill="x", padx=6, pady=(0, 4), ipadx=8, ipady=6)
                 self._group_widgets.append(lbl)
             if not collapsed:
-                for card in cards:
-                    card.pack(fill="x", padx=6, pady=4)
+                self._pack_limited(topic, cards)
         self.feed_count_label.configure(text=f"Постов: {total}, тем: {len(ordered)}")
 
     def regroup_feed(self) -> None:

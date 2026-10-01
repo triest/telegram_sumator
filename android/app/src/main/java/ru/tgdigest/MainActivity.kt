@@ -48,8 +48,7 @@ class MainActivity : AppCompatActivity() {
 
     // feed state
     private var feed: List<FeedPost> = emptyList()
-    private val collapsed = HashSet<String>()
-    private lateinit var feedAdapter: FeedAdapter
+        private lateinit var feedAdapter: FeedAdapter
     private lateinit var feedEmpty: TextView
     // channels state
     private var channels: List<Chan> = emptyList()
@@ -179,23 +178,37 @@ class MainActivity : AppCompatActivity() {
     private sealed class Row {
         data class Head(val topic: String, val n: Int, val closed: Boolean) : Row()
         data class Item(val p: FeedPost) : Row()
+        data class More(val topic: String, val left: Int) : Row()
     }
+
+    private val expanded = HashSet<String>()
+    private val groupLimit = HashMap<String, Int>()
+    private val PAGE = 20
+    private val bmpCache = object : android.util.LruCache<String, android.graphics.Bitmap>(24) {}
 
     private fun renderFeed() {
         val rows = ArrayList<Row>()
         val order = store.topics.map { it.name.trim() }
         val groups = feed.groupBy { it.topic }
-        val keys = groups.keys.sortedBy { order.indexOf(it).let { i -> if (i < 0) 99 else i } }
+        val keys = groups.keys.sortedWith(compareBy({ it.startsWith("Прочее") }, { order.indexOf(it).let { i -> if (i < 0) 99 else i } }))
         for (k in keys) {
-            val l = groups[k]!!
-            rows.add(Row.Head(k, l.size, k in collapsed))
-            if (k !in collapsed) l.sortedByDescending { it.date }.forEach { rows.add(Row.Item(it)) }
+            val l = groups[k]!!.sortedByDescending { it.date }
+            val closed = if (k in collapsedSet) true else (k.startsWith("Прочее") && k !in openedOther)
+            rows.add(Row.Head(k, l.size, closed))
+            if (!closed) {
+                val lim = groupLimit[k] ?: PAGE
+                l.take(lim).forEach { rows.add(Row.Item(it)) }
+                if (l.size > lim) rows.add(Row.More(k, l.size - lim))
+            }
         }
         feedAdapter.rows = rows
         feedAdapter.order = order
         feedAdapter.notifyDataSetChanged()
         feedEmpty.visibility = if (feed.isEmpty()) View.VISIBLE else View.GONE
     }
+
+    private val collapsedSet = HashSet<String>()
+    private val openedOther = HashSet<String>()
 
     private fun buildFeed(): View {
         val root = vbox()
@@ -216,11 +229,76 @@ class MainActivity : AppCompatActivity() {
         return root
     }
 
+    private fun plain(t: String): String =
+        t.replace(Regex("\\[([^\\]]+)\\]\\((https?://[^)\\s]+)\\)"), "$1")
+            .replace("**", "").replace("__", "").replace("`", "")
+            .replace(Regex("\\s+"), " ").trim()
+
+    /** (title, rest): first line is a title when short and followed by more text. */
+    private fun splitTitle(text: String): Pair<String, String> {
+        val lines = text.trim().lines()
+        if (lines.isEmpty()) return "" to text
+        val first = plain(lines[0])
+        val rest = lines.drop(1).joinToString("\n").trim()
+        return if (first.isNotEmpty() && rest.isNotEmpty() && first.length <= 140) first to rest else "" to text
+    }
+
+    /** Telegram markdown -> spans (bold, italic, links) + auto-linked bare URLs. */
+    private fun renderMd(text: String): CharSequence {
+        val re = Regex("\\[([^\\]]+)\\]\\((https?://[^)\\s]+)\\)|\\*\\*(.+?)\\*\\*|__(.+?)__")
+        val sb = android.text.SpannableStringBuilder()
+        var pos = 0
+        for (m in re.findAll(text)) {
+            sb.append(text.substring(pos, m.range.first))
+            pos = m.range.last + 1
+            val st = sb.length
+            when {
+                m.groupValues[1].isNotEmpty() -> {
+                    sb.append(m.groupValues[1])
+                    sb.setSpan(android.text.style.URLSpan(m.groupValues[2]), st, sb.length, 0)
+                }
+                m.groupValues[3].isNotEmpty() -> {
+                    sb.append(m.groupValues[3])
+                    sb.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), st, sb.length, 0)
+                }
+                else -> {
+                    sb.append(m.groupValues[4])
+                    sb.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.ITALIC), st, sb.length, 0)
+                }
+            }
+        }
+        sb.append(text.substring(pos))
+        android.text.util.Linkify.addLinks(sb, android.text.util.Linkify.WEB_URLS)
+        return sb
+    }
+
+    private fun bitmap(path: String, maxSide: Int): android.graphics.Bitmap? {
+        val key = "$path#$maxSide"
+        bmpCache.get(key)?.let { return it }
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, o)
+        var sample = 1
+        while (o.outWidth / (sample * 2) >= maxSide && o.outHeight / (sample * 2) >= maxSide) sample *= 2
+        val b = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+        bmpCache.put(key, b)
+        return b
+    }
+
+    private fun showFullImage(path: String) {
+        val d = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val iv = ImageView(this)
+        iv.setBackgroundColor(0xFF000000.toInt())
+        iv.scaleType = ImageView.ScaleType.FIT_CENTER
+        bitmap(path, 2048)?.let { iv.setImageBitmap(it) }
+        iv.setOnClickListener { d.dismiss() }
+        d.setContentView(iv)
+        d.show()
+    }
+
     private inner class FeedAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         var rows: List<Row> = emptyList()
         var order: List<String> = emptyList()
         override fun getItemCount() = rows.size
-        override fun getItemViewType(position: Int) = if (rows[position] is Row.Head) 0 else 1
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
             val v = vbox(0)
             v.layoutParams = RecyclerView.LayoutParams(-1, -2)
@@ -237,7 +315,9 @@ class MainActivity : AppCompatActivity() {
                         background = round(col, 12)
                         setPadding(dp(14), dp(12), dp(14), dp(12))
                         setOnClickListener {
-                            if (!collapsed.add(r.topic)) collapsed.remove(r.topic)
+                            if (r.topic.startsWith("Прочее")) {
+                                if (!openedOther.add(r.topic)) openedOther.remove(r.topic)
+                            } else if (!collapsedSet.add(r.topic)) collapsedSet.remove(r.topic)
                             renderFeed()
                         }
                     }
@@ -245,40 +325,89 @@ class MainActivity : AppCompatActivity() {
                     t.addView(label("${r.n}", 14f, 0xFFFFFFFF.toInt(), true))
                     box.addView(t, lp(l = dp(10), t = dp(10), r = dp(10)))
                 }
-                is Row.Item -> {
-                    val p = r.p
-                    val card = vbox(12).apply { background = round(C.CARD, 14) }
-                    val meta = hbox()
-                    meta.addView(label(p.channel, 14f, C.ACC, true), lp(w = 0, weight = 1f))
-                    meta.addView(label(SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(p.date * 1000)), 12f, C.DIM))
-                    card.addView(meta, lp())
-                    if (p.image.isNotEmpty() && File(p.image).exists()) {
-                        val bmp = BitmapFactory.decodeFile(p.image)
-                        if (bmp != null) {
-                            val iv = ImageView(this@MainActivity)
-                            iv.setImageBitmap(bmp)
-                            iv.adjustViewBounds = true
-                            iv.scaleType = ImageView.ScaleType.FIT_CENTER
-                            card.addView(iv, lp(t = dp(8)))
-                        }
-                    }
-                    val tv = label(p.text, 15f, C.TEXT)
-                    tv.setLineSpacing(0f, 1.15f)
-                    tv.setTextIsSelectable(true)
-                    card.addView(tv, lp(t = dp(8)))
-                    val foot = hbox()
-                    val col = topicColor(p.topic, order)
-                    foot.addView(chip(p.topic, col))
-                    val eng = when (p.engine) { "llm" -> "ИИ"; "emb" -> "смысл"; "kw" -> "слова"; else -> "" }
-                    if (eng.isNotEmpty()) foot.addView(chip("$eng ${"%.2f".format(p.score)}", C.CARD2), lp(l = dp(6)))
-                    foot.addView(View(this@MainActivity), lp(w = 0, h = 1, weight = 1f))
-                    foot.addView(button("Открыть", false) {
-                        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(p.link))) } catch (_: Exception) {}
-                    })
-                    card.addView(foot, lp(t = dp(8)))
-                    box.addView(card, lp(l = dp(10), t = dp(8), r = dp(10)))
+                is Row.More -> {
+                    box.addView(button("Показать ещё (${r.left})", false) {
+                        groupLimit[r.topic] = (groupLimit[r.topic] ?: PAGE) + PAGE
+                        renderFeed()
+                    }, lp(l = dp(10), t = dp(8), r = dp(10)))
                 }
+                is Row.Item -> bindItem(box, r.p)
             }
+        }
+
+        private fun bindItem(box: LinearLayout, p: FeedPost) {
+            val ctx = this@MainActivity
+            val isOpen = p.link in expanded
+            val (title, rest) = splitTitle(p.text)
+            val hasImg = p.image.isNotEmpty() && File(p.image).exists()
+            val long = hasImg || p.text.length > 230 || p.text.count { it == '\n' } > 3
+            val card = vbox(12).apply { background = round(C.CARD, 14) }
+            if (long) card.setOnClickListener {
+                if (!expanded.add(p.link)) expanded.remove(p.link)
+                notifyItemChanged(box.tag as? Int ?: 0)
+                renderFeed()
+            }
+
+            // header: channel (always) . time
+            val meta = hbox()
+            val chan = p.channel.ifBlank { "Канал" }
+            meta.addView(label(chan, 14f, C.ACC, true), lp(w = 0, weight = 1f))
+            meta.addView(label(SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(p.date * 1000)), 12f, C.DIM))
+
+            val textCol = vbox()
+            textCol.addView(meta, lp())
+            if (title.isNotEmpty()) textCol.addView(label(title, 16f, C.TEXT, true), lp(t = dp(3)))
+
+            if (!isOpen) {
+                val body = plain(if (title.isNotEmpty()) rest else p.text).ifEmpty { "(без текста, только картинка)" }
+                val tv = label(body, 14f, C.TEXT)
+                tv.maxLines = if (title.isNotEmpty()) 3 else 4
+                tv.ellipsize = android.text.TextUtils.TruncateAt.END
+                textCol.addView(tv, lp(t = dp(3)))
+                if (hasImg) {
+                    val row = hbox().apply { gravity = Gravity.TOP }
+                    val iv = ImageView(ctx)
+                    iv.scaleType = ImageView.ScaleType.CENTER_CROP
+                    bitmap(p.image, 360)?.let { iv.setImageBitmap(it) }
+                    iv.background = round(C.CARD2, 10)
+                    iv.clipToOutline = true
+                    row.addView(iv, lp(w = dp(88), h = dp(88), r = dp(10)))
+                    row.addView(textCol, lp(w = 0, weight = 1f))
+                    card.addView(row, lp())
+                } else card.addView(textCol, lp())
+            } else {
+                card.addView(textCol, lp())
+                if (hasImg) {
+                    val iv = ImageView(ctx)
+                    iv.adjustViewBounds = true
+                    iv.scaleType = ImageView.ScaleType.FIT_CENTER
+                    bitmap(p.image, 1080)?.let { iv.setImageBitmap(it) }
+                    iv.setOnClickListener { showFullImage(p.image) }
+                    card.addView(iv, lp(t = dp(8)))
+                }
+                val tv = label("", 15f, C.TEXT)
+                tv.text = renderMd(if (title.isNotEmpty()) rest else p.text)
+                tv.setLineSpacing(0f, 1.15f)
+                tv.movementMethod = android.text.method.LinkMovementMethod.getInstance()
+                tv.setLinkTextColor(C.ACC)
+                tv.setTextIsSelectable(true)
+                card.addView(tv, lp(t = dp(8)))
+            }
+
+            val foot = hbox()
+            foot.addView(chip(p.topic, topicColor(p.topic, order)))
+            val eng = when (p.engine) { "llm" -> "ИИ"; "emb" -> "смысл"; "kw" -> "слова"; else -> "" }
+            if (eng.isNotEmpty()) foot.addView(chip("$eng ${"%.2f".format(p.score)}", C.CARD2), lp(l = dp(6)))
+            foot.addView(View(ctx), lp(w = 0, h = 1, weight = 1f))
+            if (long) foot.addView(button(if (isOpen) "Свернуть" else "Подробнее", false) {
+                if (!expanded.add(p.link)) expanded.remove(p.link)
+                renderFeed()
+            })
+            foot.addView(button("Открыть", false) {
+                try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(p.link))) } catch (_: Exception) {}
+            }, lp(l = dp(6)))
+            card.addView(foot, lp(t = dp(8)))
+            box.addView(card, lp(l = dp(10), t = dp(8), r = dp(10)))
         }
     }
 

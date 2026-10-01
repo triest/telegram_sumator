@@ -176,12 +176,26 @@ async def check_once(
                 stats["excluded"] += len(posts) - len(candidates)
                 if candidates:
                     prior = await get_prior(ch)
+                    # picture-only / caption-only posts: fetch the picture first,
+                    # so the vision model can look at it
+                    need = [
+                        c for c in candidates
+                        if len(c.text.strip()) < 40 and (c.has_photo or c.has_video)
+                    ]
+                    if need and (getattr(relevance_filter, "vision_model", "") or app_config.show_images):
+                        async with img_sem:
+                            got = await asyncio.gather(
+                                *(client.download_thumb(c, thumbs_dir) for c in need)
+                            )
+                        for c, path in zip(need, got):
+                            c.image_path = path
                     async with score_lock:
                         results = await asyncio.to_thread(
                             lambda: relevance_filter.score_batch(
                                 [p.text for p in candidates],
                                 prior=prior,
                                 channel_title=ch.title or "",
+                                images=[c.image_path for c in candidates],
                             )
                         )
                     fresh = []
@@ -217,7 +231,7 @@ async def check_once(
     n_relevant = len(scored_posts)
     if getattr(app_config, "show_unmatched", True) and other_posts:
         other_posts.sort(key=lambda sp: sp.post.date, reverse=True)
-        scored_posts.extend(other_posts[:200])
+        scored_posts.extend(other_posts[:100])
     if hasattr(relevance_filter, "pop_stats"):
         ls = relevance_filter.pop_stats()
         logger.info(

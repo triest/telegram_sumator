@@ -147,7 +147,27 @@ class DigestWorker(threading.Thread):
             password_callback=self._password_cb,
         )
         self._emit_status("Ожидание загрузки модели...")
-        relevance_filter = await model_task
+        # The model import can be slow on a cold start (big PyTorch libraries
+        # on a slow disk, antivirus, a busy GPU). Wait patiently, show progress.
+        waited = 0
+        while not model_task.done() and waited < 1200:
+            await asyncio.wait({model_task}, timeout=5)
+            waited += 5
+            if waited % 15 == 0 and not model_task.done():
+                self._emit_status(f"Загрузка модели… {waited} с (первый запуск после перезагрузки бывает долгим)")
+        if model_task.done() and not model_task.cancelled() and model_task.exception() is None:
+            relevance_filter = model_task.result()
+        else:
+            logger.error(
+                "Модель не загрузилась (%s) — работаю по ключевым словам тем.",
+                model_task.exception() if model_task.done() else "таймаут 20 минут",
+            )
+            self._emit_status("Модель не загрузилась, работаю по ключевым словам")
+            from embed_filter import KeywordFilter, TopicKeywordBoost
+
+            relevance_filter = TopicKeywordBoost(
+                KeywordFilter(examples), app_config.topics, app_config.similarity_threshold
+            )
         logger.info("Анализ постов: %s", getattr(relevance_filter, "describe", lambda: "?")())
         logger.info("Вход в Telegram выполнен")
         client = tg
