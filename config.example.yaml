@@ -1,0 +1,54 @@
+# Copy this file to config.yaml and edit.
+
+check_interval_minutes: 40
+similarity_threshold: 0.48
+
+# Where to store data (relative to project root, created automatically)
+db_path: "data/digest.db"
+
+# Device used for the local embedding model.
+# "auto" (default) uses your NVIDIA GPU (CUDA) automatically if you
+# installed the CUDA build of torch (see README) -- much faster on PC.
+# Falls back to CPU if no GPU/CUDA is found, which is also what happens
+# automatically on Android/Termux (no CUDA there).
+# Force with "cuda" or "cpu" if you want to override auto-detection.
+embedding_device: "auto"
+
+interest_examples:
+  - "Новые модели ИИ, релизы LLM, Claude, GPT, open-source модели"
+  - "Python библиотеки, инструменты разработчика, релизы фреймворков"
+  - "Стартапы, инвестиции, интересные продукты"
+  - "Научные прорывы в AI и компьютерных науках"
+  - "Мемы про программистов и нейросети"
+
+global_exclude_keywords:
+  - "реклама"
+  - "казино"
+  - "заработок без вложений"
+
+channels:
+  # leave empty = watch all, or list specific ones
+  # - username: "somechannel"
+  #   watch: true
+
+# --- Speed ---
+only_broadcast: true      # watch only channels, skip group chats
+first_run_limit: 30       # posts per channel on the very first scan
+max_concurrent: 6         # channels fetched in parallel
+
+# --- Optional local LLM (Ollama) for topic summaries ("Сводка (ИИ)" button) ---
+# Install Ollama (ollama.com), run `ollama pull qwen2.5:3b`, then set:
+# llm_model: "qwen2.5:3b"
+llm_model: ""
+llm_url: "http://localhost:11434"
+
+# Only posts you have NOT read in Telegram yet (recommended).
+only_unread: true
+
+# --- Topics (also editable in the app: Настройки) ---
+# Each topic = name + keywords/phrases; posts are grouped by best-matching topic.
+# topics:
+#   - name: "ИИ и нейросети"
+#     keywords: ["LLM", "GPT", "Claude", "новые модели"]
+#   - name: "Стартапы"
+#     keywords: ["инвестиции", "раунд", "продукт"]

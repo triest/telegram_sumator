@@ -1,0 +1,15 @@
+# NOTE on torch: install it separately BEFORE this file so you get the
+# right build for your platform -- see README.md "GPU (CUDA) on Windows"
+# vs "CPU / Termux" install instructions. `pip install -r requirements.txt`
+# alone will pull a CPU-only torch wheel by default.
+telethon>=1.34
+PySocks>=1.7  # needed for TG_PROXY_TYPE (socks5/socks4/http) in .env
+sentence-transformers>=2.6
+numpy>=1.26
+PyYAML>=6.0
+python-dotenv>=1.0
+customtkinter>=5.2 ; sys_platform == "win32"
+pystray>=0.19 ; sys_platform == "win32"
+Pillow>=10.0 ; sys_platform == "win32"
+win10toast>=0.9 ; sys_platform == "win32"
+plyer>=2.1

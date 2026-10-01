@@ -1,0 +1,492 @@
+package ru.tgdigest
+
+import android.content.Intent
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.chaquo.python.PyObject
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
+import org.json.JSONArray
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+    private val ui = Handler(Looper.getMainLooper())
+    private val bg = Executors.newSingleThreadExecutor()
+    private val bgDl = Executors.newSingleThreadExecutor()
+    private lateinit var store: Store
+    private lateinit var core: PyObject
+    private lateinit var helper: Helper
+    private lateinit var content: FrameLayout
+    private lateinit var tabs: LinearLayout
+    private val logBuf = StringBuilder()
+    private var logView: TextView? = null
+    private var statusView: TextView? = null
+    private var scanning = false
+    private var loggedIn = false
+
+    private lateinit var feedPage: View
+    private lateinit var chanPage: View
+    private lateinit var setPage: View
+    private lateinit var logPage: View
+
+    // feed state
+    private var feed: List<FeedPost> = emptyList()
+    private val collapsed = HashSet<String>()
+    private lateinit var feedAdapter: FeedAdapter
+    private lateinit var feedEmpty: TextView
+    // channels state
+    private var channels: List<Chan> = emptyList()
+    private var blacklist = mutableSetOf<Long>()
+    private var chanFilter = ""
+    private lateinit var chanAdapter: ChanAdapter
+    private lateinit var chanCount: TextView
+
+    private fun log(msg: String) {
+        ui.post {
+            val t = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+            logBuf.append(t).append("  ").append(msg).append('\n')
+            if (logBuf.length > 60000) logBuf.delete(0, 20000)
+            logView?.text = logBuf
+            statusView?.text = msg
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        store = Store(this)
+        helper = Helper(applicationContext) { log(it) }
+        if (!Python.isStarted()) Python.start(AndroidPlatform(this))
+        core = Python.getInstance().getModule("core")
+
+        val root = vbox()
+        root.setBackgroundColor(C.BG)
+        content = FrameLayout(this)
+        root.addView(content, lp(h = 0, weight = 1f))
+        tabs = hbox().apply { setBackgroundColor(C.CARD) }
+        root.addView(tabs, lp())
+        setContentView(root)
+
+        feedPage = buildFeed(); chanPage = buildChannels(); setPage = buildSettings(); logPage = buildLog()
+        content.addView(label("Подключаюсь к Telegram…", 16f, C.DIM).apply { gravity = Gravity.CENTER }, FrameLayout.LayoutParams(-1, -1))
+
+        bg.execute {
+            try {
+                val ok = core.callAttr("init", File(filesDir, "tg").absolutePath).toBoolean()
+                ui.post { if (ok) enterMain() else showLogin() }
+            } catch (t: Throwable) {
+                log("Ошибка запуска: ${t.message}")
+                ui.post { Toast.makeText(this, "Ошибка: ${t.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    private fun show(v: View) {
+        content.removeAllViews()
+        (v.parent as? ViewGroup)?.removeView(v)
+        content.addView(v, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    // ------------------------------------------------------------ login
+    private fun showLogin() {
+        tabs.visibility = View.GONE
+        val box = vbox(24).apply { gravity = Gravity.CENTER_VERTICAL }
+        box.addView(label("Telegram Digest", 26f, C.TEXT, true))
+        box.addView(label("Вход в ваш аккаунт Telegram. Всё работает на телефоне.", 14f, C.DIM), lp(t = dp(6), b = dp(20)))
+        val phone = edit("Телефон, например +79991234567")
+        phone.inputType = android.text.InputType.TYPE_CLASS_PHONE
+        val code = edit("Код из Telegram").apply { visibility = View.GONE; inputType = android.text.InputType.TYPE_CLASS_NUMBER }
+        val pass = edit("Пароль двухфакторной защиты").apply {
+            visibility = View.GONE
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val status = label("", 13f, C.DIM)
+        var step = 0
+        val go = Button(this)
+        go.text = "Получить код"; go.isAllCaps = false
+        go.setTextColor(0xFFFFFFFF.toInt()); go.background = round(C.ACC, 10)
+        go.setOnClickListener {
+            go.isEnabled = false
+            status.text = "Подождите…"
+            bg.execute {
+                try {
+                    when (step) {
+                        0 -> {
+                            core.callAttr("send_code", phone.text.toString())
+                            ui.post { step = 1; code.visibility = View.VISIBLE; go.text = "Войти"; status.text = "Код отправлен в Telegram (в чат «Telegram» на другом устройстве)." }
+                        }
+                        1 -> {
+                            val r = core.callAttr("sign_in", code.text.toString()).toString()
+                            ui.post {
+                                if (r == "ok") enterMain()
+                                else { step = 2; pass.visibility = View.VISIBLE; go.text = "Подтвердить пароль"; status.text = "Нужен облачный пароль." }
+                            }
+                        }
+                        else -> {
+                            core.callAttr("sign_in_password", pass.text.toString())
+                            ui.post { enterMain() }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    log("Ошибка входа: ${t.message}")
+                    ui.post { status.text = "Ошибка: ${t.message}" }
+                }
+                ui.post { go.isEnabled = true }
+            }
+        }
+        box.addView(phone, lp(b = dp(10))); box.addView(code, lp(b = dp(10))); box.addView(pass, lp(b = dp(10)))
+        box.addView(go, lp()); box.addView(status, lp(t = dp(12)))
+        show(box)
+    }
+
+    private fun enterMain() {
+        loggedIn = true
+        tabs.visibility = View.VISIBLE
+        tabs.removeAllViews()
+        val pages = listOf("Лента" to feedPage, "Каналы" to chanPage, "Настройки" to setPage, "Лог" to logPage)
+        for ((name, page) in pages) {
+            val b = TextView(this).apply {
+                text = name; gravity = Gravity.CENTER; setTextColor(C.TEXT); textSize = 14f
+                setPadding(0, dp(14), 0, dp(14))
+                setOnClickListener { show(page) }
+            }
+            tabs.addView(b, lp(h = -2, weight = 1f))
+        }
+        channels = store.channels(); blacklist = store.blacklist
+        feed = store.feed(); renderFeed()
+        refreshChannelList()
+        show(feedPage)
+        if (channels.isEmpty()) loadChannels()
+    }
+
+    // ------------------------------------------------------------ feed
+    private sealed class Row {
+        data class Head(val topic: String, val n: Int, val closed: Boolean) : Row()
+        data class Item(val p: FeedPost) : Row()
+    }
+
+    private fun renderFeed() {
+        val rows = ArrayList<Row>()
+        val order = store.topics.map { it.name.trim() }
+        val groups = feed.groupBy { it.topic }
+        val keys = groups.keys.sortedBy { order.indexOf(it).let { i -> if (i < 0) 99 else i } }
+        for (k in keys) {
+            val l = groups[k]!!
+            rows.add(Row.Head(k, l.size, k in collapsed))
+            if (k !in collapsed) l.sortedByDescending { it.date }.forEach { rows.add(Row.Item(it)) }
+        }
+        feedAdapter.rows = rows
+        feedAdapter.order = order
+        feedAdapter.notifyDataSetChanged()
+        feedEmpty.visibility = if (feed.isEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun buildFeed(): View {
+        val root = vbox()
+        val top = hbox().apply { setPadding(dp(14), dp(10), dp(10), dp(6)) }
+        top.addView(label("Дайджест", 20f, C.TEXT, true), lp(w = 0, weight = 1f))
+        top.addView(button("Обновить") { startScan() })
+        root.addView(top, lp())
+        statusView = label("", 12f, C.DIM).apply { setPadding(dp(14), 0, dp(14), dp(6)) }
+        root.addView(statusView, lp())
+        feedEmpty = label("Пока пусто. Нажмите «Обновить».\nПеред первым запуском загрузите модели: Настройки → Модели.", 14f, C.DIM)
+            .apply { gravity = Gravity.CENTER; setPadding(dp(24), dp(40), dp(24), dp(40)) }
+        root.addView(feedEmpty, lp())
+        val rv = RecyclerView(this)
+        rv.layoutManager = LinearLayoutManager(this)
+        feedAdapter = FeedAdapter()
+        rv.adapter = feedAdapter
+        root.addView(rv, lp(h = 0, weight = 1f))
+        return root
+    }
+
+    private inner class FeedAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+        var rows: List<Row> = emptyList()
+        var order: List<String> = emptyList()
+        override fun getItemCount() = rows.size
+        override fun getItemViewType(position: Int) = if (rows[position] is Row.Head) 0 else 1
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            val v = vbox(0)
+            v.layoutParams = RecyclerView.LayoutParams(-1, -2)
+            return object : RecyclerView.ViewHolder(v) {}
+        }
+
+        override fun onBindViewHolder(h: RecyclerView.ViewHolder, pos: Int) {
+            val box = h.itemView as LinearLayout
+            box.removeAllViews()
+            when (val r = rows[pos]) {
+                is Row.Head -> {
+                    val col = topicColor(r.topic, order)
+                    val t = hbox().apply {
+                        background = round(col, 12)
+                        setPadding(dp(14), dp(12), dp(14), dp(12))
+                        setOnClickListener {
+                            if (!collapsed.add(r.topic)) collapsed.remove(r.topic)
+                            renderFeed()
+                        }
+                    }
+                    t.addView(label((if (r.closed) "▸  " else "▾  ") + r.topic, 16f, 0xFFFFFFFF.toInt(), true), lp(w = 0, weight = 1f))
+                    t.addView(label("${r.n}", 14f, 0xFFFFFFFF.toInt(), true))
+                    box.addView(t, lp(l = dp(10), t = dp(10), r = dp(10)))
+                }
+                is Row.Item -> {
+                    val p = r.p
+                    val card = vbox(12).apply { background = round(C.CARD, 14) }
+                    val meta = hbox()
+                    meta.addView(label(p.channel, 14f, C.ACC, true), lp(w = 0, weight = 1f))
+                    meta.addView(label(SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(p.date * 1000)), 12f, C.DIM))
+                    card.addView(meta, lp())
+                    if (p.image.isNotEmpty() && File(p.image).exists()) {
+                        val bmp = BitmapFactory.decodeFile(p.image)
+                        if (bmp != null) {
+                            val iv = ImageView(this@MainActivity)
+                            iv.setImageBitmap(bmp)
+                            iv.adjustViewBounds = true
+                            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+                            card.addView(iv, lp(t = dp(8)))
+                        }
+                    }
+                    val tv = label(p.text, 15f, C.TEXT)
+                    tv.setLineSpacing(0f, 1.15f)
+                    tv.setTextIsSelectable(true)
+                    card.addView(tv, lp(t = dp(8)))
+                    val foot = hbox()
+                    val col = topicColor(p.topic, order)
+                    foot.addView(chip(p.topic, col))
+                    val eng = when (p.engine) { "llm" -> "ИИ"; "emb" -> "смысл"; "kw" -> "слова"; else -> "" }
+                    if (eng.isNotEmpty()) foot.addView(chip("$eng ${"%.2f".format(p.score)}", C.CARD2), lp(l = dp(6)))
+                    foot.addView(View(this@MainActivity), lp(w = 0, h = 1, weight = 1f))
+                    foot.addView(button("Открыть", false) {
+                        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(p.link))) } catch (_: Exception) {}
+                    })
+                    card.addView(foot, lp(t = dp(8)))
+                    box.addView(card, lp(l = dp(10), t = dp(8), r = dp(10)))
+                }
+            }
+        }
+    }
+
+    private fun startScan() {
+        if (scanning) { Toast.makeText(this, "Уже идёт проверка", Toast.LENGTH_SHORT).show(); return }
+        scanning = true
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        log("Старт проверки")
+        val cfgJson = store.scanSettings()
+        val useLlm = store.useLlm
+        bg.execute {
+            try {
+                val msg = helper.load(useLlm)
+                if (msg.isNotEmpty()) log(msg)
+                if (Downloader.ready(this, Specs.SPM)) core.callAttr("load_tokenizer", Downloader.file(this, Specs.SPM).absolutePath)
+                if (!helper.hasEmbed()) log("Модель эмбеддингов не загружена — работаю только по ключевым словам (Настройки → Модели)")
+                val res = core.callAttr("scan", cfgJson, helper).toString()
+                store.feedJson = res
+                val f = store.feed()
+                ui.post { feed = f; renderFeed() }
+            } catch (t: Throwable) {
+                log("ОШИБКА: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                ui.post { scanning = false; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ channels
+    private fun buildChannels(): View {
+        val root = vbox()
+        val top = vbox(12)
+        top.addView(label("Каналы", 20f, C.TEXT, true))
+        val search = edit("Поиск по названию")
+        search.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) { chanFilter = s.toString().trim().lowercase(); refreshChannelList() }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        top.addView(search, lp(t = dp(8)))
+        val row = hbox()
+        row.addView(button("Выбрать все") { setAll(true) }, lp(r = dp(6)))
+        row.addView(button("Снять все") { setAll(false) }, lp(r = dp(6)))
+        row.addView(button("Загрузить список", false) { loadChannels() })
+        top.addView(row, lp(t = dp(8)))
+        chanCount = label("", 12f, C.DIM)
+        top.addView(chanCount, lp(t = dp(6)))
+        root.addView(top, lp())
+        val rv = RecyclerView(this)
+        rv.layoutManager = LinearLayoutManager(this)
+        chanAdapter = ChanAdapter()
+        rv.adapter = chanAdapter
+        root.addView(rv, lp(h = 0, weight = 1f))
+        return root
+    }
+
+    private fun visibleChannels() =
+        channels.filter { chanFilter.isEmpty() || it.title.lowercase().contains(chanFilter) }
+
+    private fun refreshChannelList() {
+        chanAdapter.items = visibleChannels()
+        chanAdapter.notifyDataSetChanged()
+        val on = channels.count { it.id !in blacklist }
+        chanCount.text = "Отслеживается $on из ${channels.size}"
+    }
+
+    private fun setAll(on: Boolean) {
+        for (c in visibleChannels()) if (on) blacklist.remove(c.id) else blacklist.add(c.id)
+        store.blacklist = blacklist
+        refreshChannelList()
+    }
+
+    private fun loadChannels() {
+        log("Загружаю список каналов…")
+        bg.execute {
+            try {
+                val js = core.callAttr("list_channels").toString()
+                store.channelsJson = js
+                val l = store.channels()
+                ui.post { channels = l; refreshChannelList(); log("Каналов: ${l.size} (в архиве ${l.count { it.archived }})") }
+            } catch (t: Throwable) { log("Ошибка списка каналов: ${t.message}") }
+        }
+    }
+
+    private inner class ChanAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+        var items: List<Chan> = emptyList()
+        override fun getItemCount() = items.size
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            val cb = CheckBox(this@MainActivity).apply {
+                setTextColor(C.TEXT); textSize = 15f
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                layoutParams = RecyclerView.LayoutParams(-1, -2)
+            }
+            return object : RecyclerView.ViewHolder(cb) {}
+        }
+        override fun onBindViewHolder(h: RecyclerView.ViewHolder, pos: Int) {
+            val c = items[pos]
+            val cb = h.itemView as CheckBox
+            cb.setOnCheckedChangeListener(null)
+            cb.text = c.title + (if (c.archived) "  · архив" else "") + (if (c.unread > 0) "  · ${c.unread}" else "")
+            cb.isChecked = c.id !in blacklist
+            cb.setOnCheckedChangeListener { _, on ->
+                if (on) blacklist.remove(c.id) else blacklist.add(c.id)
+                store.blacklist = blacklist
+                chanCount.text = "Отслеживается ${channels.count { it.id !in blacklist }} из ${channels.size}"
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ settings
+    private fun buildSettings(): View {
+        val sv = ScrollView(this)
+        val box = vbox(14)
+        sv.addView(box)
+
+        box.addView(label("Настройки", 20f, C.TEXT, true))
+
+        // models
+        box.addView(label("Модели на телефоне", 16f, C.ACC, true), lp(t = dp(16)))
+        box.addView(label("Скачиваются один раз по Wi-Fi и работают без интернета.", 12f, C.DIM), lp(b = dp(6)))
+        for (spec in listOf(Specs.EMBED, Specs.SPM, Specs.LLM)) {
+            val row = vbox(10).apply { background = round(C.CARD, 12) }
+            val st = label("", 12f, C.DIM)
+            fun refresh() { st.text = if (Downloader.ready(this, spec)) "✓ загружено" else "не загружено (~${spec.approxMb} МБ)" }
+            refresh()
+            row.addView(label(spec.title, 14f, C.TEXT, true))
+            row.addView(st, lp(t = dp(2)))
+            row.addView(button("Скачать") {
+                if (Downloader.ready(this, spec)) { refresh(); return@button }
+                st.text = "Скачивание…"
+                bgDl.execute {
+                    val err = Downloader.download(this, spec) { d, t ->
+                        ui.post { st.text = "Скачано ${d / 1048576} из ${if (t > 0) (t / 1048576).toString() else "?"} МБ" }
+                    }
+                    ui.post { if (err != null) st.text = "Ошибка: $err. Нажмите «Скачать» ещё раз — докачается." else refresh() }
+                    log(if (err != null) "Загрузка ${spec.title}: $err" else "Загружено: ${spec.title}")
+                }
+            }, lp(t = dp(6)))
+            box.addView(row, lp(b = dp(8)))
+        }
+        val llmSw = Switch(this).apply {
+            text = "ИИ-проверка спорных постов"; setTextColor(C.TEXT)
+            isChecked = store.useLlm
+            setOnCheckedChangeListener { _, v -> store.useLlm = v }
+        }
+        box.addView(llmSw, lp(t = dp(4)))
+
+        // topics
+        box.addView(label("Темы", 16f, C.ACC, true), lp(t = dp(18)))
+        box.addView(label("Название и слова через запятую. Чем конкретнее слова, тем точнее.", 12f, C.DIM), lp(b = dp(6)))
+        val topicsBox = vbox()
+        box.addView(topicsBox, lp())
+        fun addRow(t: Topic) {
+            val r = vbox(10).apply { background = round(C.CARD, 12) }
+            val n = edit("Название темы", t.name)
+            val k = edit("Слова через запятую", t.keywords, true)
+            r.addView(n, lp()); r.addView(k, lp(t = dp(6)))
+            r.addView(button("Удалить", false) { topicsBox.removeView(r) }, lp(t = dp(6)))
+            topicsBox.addView(r, lp(b = dp(8)))
+        }
+        store.topics.forEach { addRow(it) }
+        box.addView(button("+ Добавить тему", false) { addRow(Topic("", "")) }, lp())
+
+        // params
+        box.addView(label("Параметры", 16f, C.ACC, true), lp(t = dp(18)))
+        val thr = edit("Порог схожести (0.30–0.60)", store.threshold.toString())
+        val lim = edit("Постов с канала за проход", store.perChannel.toString())
+        val bud = edit("Лимит ИИ-проверок за проход", store.llmBudget.toString())
+        box.addView(label("Порог: выше — строже", 12f, C.DIM)); box.addView(thr, lp(b = dp(6)))
+        box.addView(label("Постов с канала", 12f, C.DIM)); box.addView(lim, lp(b = dp(6)))
+        box.addView(label("ИИ-проверок (чем больше, тем дольше)", 12f, C.DIM)); box.addView(bud, lp(b = dp(6)))
+        val bc = Switch(this).apply { text = "Только каналы (без групп)"; setTextColor(C.TEXT); isChecked = store.onlyBroadcast }
+        val im = Switch(this).apply { text = "Показывать картинки"; setTextColor(C.TEXT); isChecked = store.showImages }
+        box.addView(bc, lp(t = dp(4))); box.addView(im, lp(t = dp(4)))
+
+        box.addView(button("Сохранить") {
+            val list = mutableListOf<Topic>()
+            for (i in 0 until topicsBox.childCount) {
+                val r = topicsBox.getChildAt(i) as LinearLayout
+                val name = (r.getChildAt(0) as EditText).text.toString().trim()
+                val kw = (r.getChildAt(1) as EditText).text.toString().trim()
+                if (name.isNotEmpty()) list.add(Topic(name, kw))
+            }
+            store.topics = list
+            thr.text.toString().replace(',', '.').toFloatOrNull()?.let { store.threshold = it.coerceIn(0.2f, 0.8f) }
+            lim.text.toString().toIntOrNull()?.let { store.perChannel = it.coerceIn(5, 200) }
+            bud.text.toString().toIntOrNull()?.let { store.llmBudget = it.coerceIn(0, 200) }
+            store.onlyBroadcast = bc.isChecked
+            store.showImages = im.isChecked
+            Toast.makeText(this, "Сохранено", Toast.LENGTH_SHORT).show()
+            renderFeed()
+        }, lp(t = dp(16)))
+
+        box.addView(button("Выйти из аккаунта", false) {
+            bg.execute {
+                try { core.callAttr("logout") } catch (_: Throwable) {}
+                ui.post { showLogin() }
+            }
+        }, lp(t = dp(10), b = dp(24)))
+        return sv
+    }
+
+    // ------------------------------------------------------------ log
+    private fun buildLog(): View {
+        val sv = ScrollView(this)
+        val tv = label("", 12f, C.DIM).apply { setPadding(dp(12), dp(12), dp(12), dp(12)); setTextIsSelectable(true) }
+        logView = tv
+        sv.addView(tv)
+        return sv
+    }
+}

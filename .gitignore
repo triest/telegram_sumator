@@ -1,0 +1,45 @@
+# secrets / local state
+.env
+config.yaml
+session/
+data/
+cache/
+*.session
+*.session-journal
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build output
+build/
+dist/
+*.spec
+*.exe
+*.apk
+*.aab
+
+# logs, backups, scratch
+*.log
+*.bak
+*.part
+Claude outputs/
+
+# android project
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/captures/
+*.jks
+*.keystore
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
