@@ -14,28 +14,13 @@ Build a personal Telegram channel digest tool that:
 - Model must be small enough to run on a mid-range Android phone (CPU).
 
 ## Preferred Local Model Approach
-**Primary: Embedding + Cosine Similarity** (measured on real posts from the user's channels:
-overall accuracy 0.85 vs 0.70 for the old MiniLM, see skill `.claude/skills/digest-recognition`)
+Local embeddings (`Qwen/Qwen3-Embedding-0.6B`, config `embedding_model`, threshold `similarity_threshold` 0.62 —
+thresholds are model-specific) + exact topic keywords + local CLIP for pictures. Everything runs in-process:
+**no Ollama, no cloud**. The embedded GGUF LLM is only for "Сводка (ИИ)" and naming auto topics, not for classification.
+Fallback: keyword filter if the model is not downloaded.
 
-- Library: `sentence-transformers`, model `Qwen/Qwen3-Embedding-0.6B` (config `embedding_model`).
-  The old `paraphrase-multilingual-MiniLM-L12-v2` still works (threshold ~0.38) for weak devices.
-- Posts are encoded with a task instruction prefix; topics are compared by their **name only**
-  (keywords are matched exactly by `TopicKeywordBoost`). Default `similarity_threshold` 0.62.
-- Thresholds are **model-specific**: changing the model means re-tuning the threshold.
-- For each new post: max cosine similarity to the topics -> if >= threshold -> show it.
-- Channel context: per-topic baseline from `NEUTRAL_PROBES` is subtracted, a channel gets a "home"
-  topic only with a clear margin (generic topics like "кино" otherwise attract everything).
-- Manual verdicts (👍 Верно / 👎 Не то / move to topic) are stored in SQLite `feedback` and applied
-  to near-identical posts (cosine >= 0.85).
-- Pictures: local CLIP (`image_topics.py`, multilingual text encoder) for picture-only / short-caption posts.
-- Auto topics (`auto_topics: true`): posts that fit no topic are clustered; a big enough group becomes
-  a new topic (name from the embedded LLM, keywords from the group).
-- Preview = first 250 characters of the post. Everything runs in-process: **no Ollama**.
-
-**Embedded LLM** (llama-cpp-python GGUF, only for "Сводка (ИИ)" and naming auto topics). It is NOT used
-for classification (`llm_classify: false`): on real posts it was worse than embeddings (61% vs 85%) and slow on CPU.
-
-**Fallback**: pure keyword/regex filter if the model is not downloaded.
+Details (architecture, measured results, how to benchmark, pitfalls) are in the skill
+`digest-recognition` — load it when touching recognition. History/decisions: `digest-session-log`.
 
 ## Tech Stack
 - Python 3.11+
@@ -83,3 +68,24 @@ for classification (`llm_classify: false`): on real posts it was worse than embe
 3. Windows GUI + tray.
 4. Make core clean enough for Termux.
 5. Termux version with notifications.
+## Working agreements (from the owner)
+- **No Ollama.** Everything runs inside the program (sentence-transformers, CLIP, embedded llama-cpp GGUF).
+- **Desktop (Windows) first**; Termux / Android get the same ideas later.
+- **Test on real posts** from the connected Telegram (read-only, broadcast channels only), not on made-up samples.
+  Re-check the final result through the real app code path after implementing ("сверь результат").
+- Prefer the measurably better option and implement it; report numbers honestly (what got better, what did not).
+- The GPU is shared with ComfyUI generations: heavy runs can be slow; wait instead of killing other processes.
+- Commit and push only when asked. Secrets stay in `.env`; `config.yaml`, `session/`, `data/`, `models/` are git-ignored.
+- Run from source with `run_source.bat` (`TelegramDigest.exe` / `run_gui.bat` use the old `dist` build until rebuilt).
+
+## Skills in this repo
+Skills load on demand (only their name/description sit in context; the body opens when the task matches):
+- `.claude/skills/digest-recognition` — architecture, measured results and how to benchmark recognition.
+- `.claude/skills/digest-session-log` — what was decided/done in the 2026-10-17 tuning session; open questions.
+
+## Open work
+- Port Qwen3-Embedding / feedback / baseline fixes to `termux_main.py` and `android/.../core.py` (only `embedding_model` is wired for Termux).
+- Rebuild the PyInstaller exe (the old `dist` build lacks all recent changes).
+- Validate in the running GUI: 👍/👎 buttons, auto-topics checkbox, CLIP model download on first picture.
+- Auto topics: keywords are weak (generic words); consider merging with similar existing topics (e.g. "Армия" vs "СВО").
+- Re-tune `similarity_threshold` (0.62) after the user's own 👍/👎 data accumulates in the `feedback` table.
