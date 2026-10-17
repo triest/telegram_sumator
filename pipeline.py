@@ -30,8 +30,7 @@ class ScoredPost:
 
 
 # thresholds for a channel's "home" topic (similarity above the neutral baseline)
-HOME_MIN_TOP = 0.09
-HOME_MIN_GAP = 0.035
+HOME_MIN_SHARE = 0.30  # share of a channel's recent posts that fall into one topic
 
 NEUTRAL_PROBES = [
     "Сегодня ходил в магазин, купил хлеб и молоко, потом гулял по парку",
@@ -116,7 +115,7 @@ async def check_once(
     use_ctx = ctx_weight > 0 and hasattr(relevance_filter, "topic_matrix")
     # (the model is part of the signature: profiles made by another model are not comparable)
     sig = hashlib.md5(
-        ("|".join(app_config.all_examples()) + "#" + app_config.embedding_model).encode("utf-8")
+        ("|".join(app_config.all_examples()) + "#" + app_config.embedding_model + "#v2").encode("utf-8")
     ).hexdigest()
     # Some topics (short generic names like "кино") are similar to almost any text. Their
     # typical similarity to neutral posts is subtracted, otherwise such a topic becomes
@@ -134,6 +133,7 @@ async def check_once(
 
     topic_names = [t.name for t in app_config.topics]
     example_by_name = {t.name: t.as_example() for t in app_config.topics}
+    topic_index = {t.as_example(): k for k, t in enumerate(app_config.topics)}
     force = bool(getattr(app_config, "force_category", True)) and bool(topic_names)
     home_auto: dict[int, str] = {}  # channel_id -> category inferred from the channel's profile
 
@@ -181,26 +181,34 @@ async def check_once(
                     ]
                 texts = [p.text for p in sample if p.text and p.text.strip()]
                 texts.append(ch.title or "")
-                if len(texts) < 4:
+                if len(texts) < 3:
                     return None  # too little text to say what the channel is about
                 async with score_lock:
                     matrix = await asyncio.to_thread(relevance_filter.topic_matrix, texts)
+                    verdicts = await asyncio.to_thread(relevance_filter.score_batch, texts[:-1])
                 if matrix is None or len(matrix) == 0:
                     return None
-                vec = matrix.mean(axis=0).tolist()
+                # profile = mean similarity per example + share of the channel's recent posts
+                # that the filter itself assigned to each topic
+                counts = [0] * len(topic_names)
+                for r in verdicts:
+                    if r.is_relevant and r.matched_example in topic_index:
+                        counts[topic_index[r.matched_example]] += 1
+                shares = [c / max(1, len(verdicts)) for c in counts]
+                vec = matrix.mean(axis=0).tolist() + shares
                 storage.set_profile(ch.channel_id, sig, vec, now)
-            v = np.asarray(vec, dtype=float)
+            n_mean = len(app_config.all_examples())
+            v = np.asarray(vec[:n_mean], dtype=float)
+            shares = list(vec[n_mean:n_mean + len(topic_names)])
             if baseline is not None and len(baseline) == len(v):
                 v = v - baseline
-            if topic_names and len(v) >= len(topic_names):
-                tv = v[: len(topic_names)]
-                order = np.argsort(-tv)
-                home = topic_names[int(order[0])]
-                if baseline is not None and len(order) > 1:
-                    # a channel gets a "home" topic only when one topic is clearly ahead;
-                    # otherwise (a personal blog, a mix) its posts are not pushed into one
-                    if tv[order[0]] < HOME_MIN_TOP or tv[order[0]] - tv[order[1]] < HOME_MIN_GAP:
-                        home = ""
+            if topic_names and len(shares) == len(topic_names):
+                # a channel's "home" topic = the topic most of its posts fall into, if clearly ahead;
+                # a personal blog / a mix gets none (its posts are then not pushed into a topic)
+                order = np.argsort(-np.asarray(shares))
+                top = shares[int(order[0])]
+                second = shares[int(order[1])] if len(order) > 1 else 0.0
+                home = topic_names[int(order[0])] if (top >= HOME_MIN_SHARE and top >= 1.5 * second) else ""
                 home_auto[ch.channel_id] = home
                 storage.set_channel_category(ch.channel_id, home, "auto")
             prior = np.clip((v - v.mean()) * ctx_weight, -0.15, 0.2)

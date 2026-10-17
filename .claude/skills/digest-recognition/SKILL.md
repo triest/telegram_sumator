@@ -9,7 +9,7 @@ All AI is local and in-process (no Ollama, no cloud). Windows desktop first.
 
 ## Pipeline (files)
 - `embed_filter.py` — `EmbeddingFilter` (Qwen3-Embedding-0.6B, instruction prefix on posts; a topic = average of two views: bare name and "name: keywords"; exact keyword hits ADD `kw_bonus` 0.12 per hit (max 2) to the semantic score), `TopicKeywordBoost` (exact keyword stems, passes hit counts to the embedding filter), `LLMTopicVerifier` (disabled: `llm_classify: false`).
-- `pipeline.py` — `check_once`: fetch → score → "home topic" fallback. `NEUTRAL_PROBES` baseline is subtracted from channel profiles; a channel gets a home topic only if top ≥ `HOME_MIN_TOP` and gap ≥ `HOME_MIN_GAP`. Posts of channels without a clear home stay in "Прочее" (no "closest topic" forcing).
+- `pipeline.py` — `check_once`: fetch → score → "home topic" fallback. A channel's home topic = the topic most of its recent posts fall into (share ≥ `HOME_MIN_SHARE` 0.30 and ≥ 1.5× the runner-up), cached in `channel_profile` (signature includes model + `#v2`); `NEUTRAL_PROBES` baseline is subtracted from the similarity prior. Posts of channels without a clear home stay in "Прочее" (no "closest topic" forcing).
 - `image_topics.py` — CLIP (`clip-ViT-B-32` + multilingual text encoder). Used for picture-only / caption < 60 chars posts; distractor classes (food, cats, scenery, screenshots…) prevent forcing.
 - `auto_topics.py` + `DigestWorker._auto_create_topics` — clusters posts no topic fit; group ≥ `auto_topics_min_posts` → new topic. Name via `llm.suggest_topic_name` (embedded GGUF), keywords from the group.
 - Feedback: GUI buttons 👍/👎 and "move to topic" → `storage.add_feedback`; `EmbeddingFilter.set_feedback` applies verdicts to near-identical posts (cosine ≥ `FEEDBACK_SIM` 0.85). Source label `вручную` beats keywords.
@@ -30,6 +30,7 @@ Pictures: CLIP name+6 keywords+distractors, prob ≥ 0.35 → 38/49, 0 false pos
 - Name-only topic text failed for acronyms ("СВО"): the topic is now avg(name, "name: keywords").
 - Tried and rejected: LLM-written topic descriptions (3B model just echoes the keywords), prototypes from keyword-matched posts (floods false positives), topic-as-query orientation (set114 max 88 vs 98), per-topic baselines (no gain).
 - Real fix for vague topics is the user's keyword list: added Украина/Зеленский/Киев/ВС РФ/обстрел/дрон/… to СВО and сериал/трейлер/режиссёр/… to кино in `config.yaml`.
+- Live check on the real unread feed (133 posts, `live.py` pattern: `check_once` + dump): СВО 36→55 posts after switching the home topic to the posts-share rule (picture-only posts of war channels now follow the channel topic); 'Прочее' 57→43. Known weak spot: CLIP sends some cosplay/humor pictures to 'история'.
 - Second benchmark (290 posts, weak labels by channel + regex, noisy): СВО war posts 25/32 (was 0), кино 73/79, set114 91/114 (96 before the bonus; the extra false positives come from keyword hits).
 
 ## How to benchmark (do this before changing models/thresholds)
