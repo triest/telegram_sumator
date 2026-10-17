@@ -48,3 +48,7 @@ Thumbs.db
 _apk_parts/
 
 models/
+
+dist_old/
+dist_new/
+build_new/
