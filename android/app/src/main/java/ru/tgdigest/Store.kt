@@ -37,8 +37,8 @@ class Store(ctx: Context) {
         set(v) { p.edit().putString("black", v.joinToString(",")).apply() }
 
     var threshold: Float
-        get() = p.getFloat("thr", 0.42f)
-        set(v) { p.edit().putFloat("thr", v).apply() }
+        get() = p.getFloat("thr2", 0.35f)
+        set(v) { p.edit().putFloat("thr2", v).apply() }
     var perChannel: Int
         get() = p.getInt("lim", 40)
         set(v) { p.edit().putInt("lim", v).apply() }
@@ -52,8 +52,32 @@ class Store(ctx: Context) {
         get() = p.getBoolean("llm", true)
         set(v) { p.edit().putBoolean("llm", v).apply() }
     var llmBudget: Int
-        get() = p.getInt("budget", 30)
-        set(v) { p.edit().putInt("budget", v).apply() }
+        get() = p.getInt("budget2", 60)
+        set(v) { p.edit().putInt("budget2", v).apply() }
+
+    /** Manual corrections: post text -> topic ("" = none). Newest first. */
+    fun feedback(): List<Pair<String, String>> {
+        val a = JSONArray(p.getString("feedback", "[]"))
+        return List(a.length()) { a.getJSONObject(it).getString("text") to a.getJSONObject(it).getString("topic") }
+    }
+
+    fun addFeedback(text: String, topic: String) {
+        val cur = feedback().filter { it.first != text }.toMutableList()
+        cur.add(0, text.take(600) to topic)
+        val a = JSONArray()
+        cur.take(150).forEach { a.put(JSONObject().put("text", it.first).put("topic", it.second)) }
+        p.edit().putString("feedback", a.toString()).apply()
+    }
+
+    fun saveFeed(list: List<FeedPost>) {
+        val a = JSONArray()
+        list.forEach {
+            a.put(JSONObject().put("channel", it.channel).put("date", it.date).put("text", it.text)
+                .put("topic", it.topic).put("score", it.score).put("engine", it.engine)
+                .put("image", it.image).put("link", it.link))
+        }
+        feedJson = a.toString()
+    }
 
     var channelsJson: String
         get() = p.getString("channels", "[]")!!
@@ -95,6 +119,9 @@ class Store(ctx: Context) {
         o.put("show_images", showImages)
         o.put("use_llm", useLlm)
         o.put("llm_budget", llmBudget)
+        val fa = JSONArray()
+        feedback().forEach { fa.put(JSONObject().put("text", it.first).put("topic", it.second)) }
+        o.put("feedback", fa)
         return o.toString()
     }
 }

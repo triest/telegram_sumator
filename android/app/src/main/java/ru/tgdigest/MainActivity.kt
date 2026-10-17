@@ -396,19 +396,41 @@ class MainActivity : AppCompatActivity() {
 
             val foot = hbox()
             foot.addView(chip(p.topic, topicColor(p.topic, order)))
-            val eng = when (p.engine) { "llm" -> "ИИ"; "emb" -> "смысл"; "kw" -> "слова"; else -> "" }
+            val eng = when (p.engine) { "llm" -> "ИИ"; "emb" -> "смысл"; "kw" -> "слова"; "вручную" -> "вручную"; else -> "" }
             if (eng.isNotEmpty()) foot.addView(chip("$eng ${"%.2f".format(p.score)}", C.CARD2), lp(l = dp(6)))
             foot.addView(View(ctx), lp(w = 0, h = 1, weight = 1f))
             if (long) foot.addView(button(if (isOpen) "Свернуть" else "Подробнее", false) {
                 if (!expanded.add(p.link)) expanded.remove(p.link)
                 renderFeed()
             })
+            var topicBtn: Button? = null
+            topicBtn = button("Тема ▾", false) {
+                val pm = android.widget.PopupMenu(ctx, topicBtn!!)
+                store.topics.map { t -> t.name.trim() }.filter { n -> n.isNotEmpty() }.forEach { n -> pm.menu.add(n) }
+                pm.menu.add("Прочее (не подошло)")
+                pm.setOnMenuItemClickListener { item ->
+                    movePost(p, item.title.toString())
+                    true
+                }
+                pm.show()
+            }
+            foot.addView(topicBtn, lp(l = dp(6)))
             foot.addView(button("Открыть", false) {
                 try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(p.link))) } catch (_: Exception) {}
             }, lp(l = dp(6)))
             card.addView(foot, lp(t = dp(8)))
             box.addView(card, lp(l = dp(10), t = dp(8), r = dp(10)))
         }
+    }
+
+    /** User says: this post belongs to <topic> (or to none). Remembered as an example. */
+    private fun movePost(p: FeedPost, topic: String) {
+        val saved = if (topic.startsWith("Прочее")) "" else topic
+        store.addFeedback(p.text, saved)
+        feed = feed.map { if (it.link == p.link) it.copy(topic = topic, engine = "вручную", score = 1.0) else it }
+        store.saveFeed(feed)
+        renderFeed()
+        Toast.makeText(this, "Запомнил. Учту при следующей проверке.", Toast.LENGTH_SHORT).show()
     }
 
     private fun startScan() {

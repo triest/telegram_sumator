@@ -38,6 +38,7 @@ async def run(limit_per_channel: int) -> None:
         app_config.all_examples(),
         threshold=app_config.similarity_threshold,
         device=app_config.embedding_device,
+                model_name=app_config.embedding_model,
         topics=app_config.topics,
         llm_model=app_config.llm_model if app_config.llm_classify else "",
         llm_url=app_config.llm_url,

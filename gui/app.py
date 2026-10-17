@@ -119,7 +119,10 @@ class PostCard(ctk.CTkFrame):
     SNIPPET = 230
     THUMB = 104
 
-    def __init__(self, master, scored: ScoredPost) -> None:
+    def __init__(
+        self, master, scored: ScoredPost, on_move=None, topic_names=None, on_channel=None,
+        on_confirm=None, on_reject=None,
+    ) -> None:
         super().__init__(
             master,
             corner_radius=12,
@@ -130,6 +133,11 @@ class PostCard(ctk.CTkFrame):
         self.scored = scored
         self.topic = topic_label(scored)
         self._post = scored.post
+        self._on_move = on_move
+        self._on_channel = on_channel
+        self._on_confirm = on_confirm
+        self._on_reject = on_reject
+        self._topic_names = list(topic_names or [])
         self._text_full = self._post.text.strip() or "(без текста, только картинка)"
         self._has_img = bool(
             getattr(self._post, "image_path", None) and os.path.exists(self._post.image_path)
@@ -326,7 +334,8 @@ class PostCard(ctk.CTkFrame):
         c += 1
         src = {
             "ИИ": "ИИ", "ИИ-фото": "ИИ по картинке", "слова": "слова",
-            "смысл": "смысл", "канал": "по теме канала",
+            "смысл": "смысл", "канал": "по теме канала", "вручную": "вручную",
+            "картинка": "по картинке",
         }.get(scored.result.source, "")
         if src:
             _chip(foot, src, fg=("#eef1f6", "#2a3244"), text_color=("#4b5563", "#9aa5b8"), size=11).grid(
@@ -338,12 +347,51 @@ class PostCard(ctk.CTkFrame):
                 row=0, column=c, padx=(6, 0)
             )
             c += 1
+        # one-click verdict on the classification: both feed the local filter's examples
+        if (
+            self._on_confirm and self._on_reject
+            and scored.result.source != "вручную"
+            and self.topic in self._topic_names
+        ):
+            ctk.CTkButton(
+                foot, text="👍 Верно", width=74, height=24, corner_radius=8,
+                fg_color=("#e6f4ea", "#1f3a2a"), hover_color=("#cfe9d7", "#2a4d38"),
+                text_color=("#1e7a3c", "#7fd49a"), command=lambda: self._on_confirm(self),
+            ).grid(row=0, column=c, padx=(8, 0))
+            c += 1
+            ctk.CTkButton(
+                foot, text="👎 Не то", width=74, height=24, corner_radius=8,
+                fg_color=("#fdeaea", "#3d2326"), hover_color=("#f8d3d3", "#552e32"),
+                text_color=("#b3261e", "#f2a5a0"), command=lambda: self._on_reject(self),
+            ).grid(row=0, column=c, padx=(6, 0))
+            c += 1
         if self._expandable:
             ctk.CTkButton(
                 foot, text="Свернуть ▴" if self._expanded else "Подробнее ▾", width=90, height=24,
                 corner_radius=8, fg_color="transparent", hover_color=("#eef1f6", "#2a3244"),
                 text_color=("#1a56c4", "#8ab4ff"), command=self._toggle,
             ).grid(row=0, column=10, sticky="e")
+        if self._on_move and self._topic_names:
+            choices = [n for n in self._topic_names] + [OTHER_TOPIC]
+            menu = ctk.CTkOptionMenu(
+                foot, values=choices, width=150, height=24, corner_radius=8,
+                dynamic_resizing=False, font=ctk.CTkFont(size=11),
+                fg_color=("#eef1f6", "#2a3244"), button_color=("#dbe1ea", "#3a4560"),
+                text_color=("#374151", "#c9d3e6"),
+                command=lambda choice: self._on_move(self, choice),
+            )
+            menu.set("Перенести в тему…")
+            menu.grid(row=0, column=12, padx=(6, 0), sticky="e")
+        if self._on_channel and self._topic_names:
+            cmenu = ctk.CTkOptionMenu(
+                foot, values=list(self._topic_names), width=150, height=24, corner_radius=8,
+                dynamic_resizing=False, font=ctk.CTkFont(size=11),
+                fg_color=("#eef1f6", "#2a3244"), button_color=("#dbe1ea", "#3a4560"),
+                text_color=("#374151", "#c9d3e6"),
+                command=lambda choice: self._on_channel(self, choice),
+            )
+            cmenu.set("Канал → тема…")
+            cmenu.grid(row=0, column=13, padx=(6, 0), sticky="e")
         ctk.CTkButton(
             foot, text="Открыть в Telegram ↗", width=150, height=24, corner_radius=8,
             fg_color=("#e8f0fe", "#243049"), hover_color=("#d6e4fd", "#2f3f60"),
@@ -466,6 +514,11 @@ class SettingsTab(ctk.CTkFrame):
         ctk.CTkButton(
             head, text="+ Добавить тему", width=140, command=lambda: self._add_topic_row()
         ).pack(side="right")
+        ctk.CTkButton(
+            head, text="Стандартные темы", width=140, fg_color=("#e8f0fe", "#243049"),
+            hover_color=("#d6e4fd", "#2f3f60"), text_color=("#1a56c4", "#8ab4ff"),
+            command=self._add_default_topics,
+        ).pack(side="right", padx=(0, 8))
 
         cols = ctk.CTkFrame(top, fg_color="transparent")
         cols.grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -504,6 +557,14 @@ class SettingsTab(ctk.CTkFrame):
         )
         self.interval_entry = ctk.CTkEntry(params_frame, width=80)
         self.interval_entry.grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        self.auto_topics_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            params_frame,
+            text="Создавать новые темы автоматически (если набралась группа похожих постов, "
+            "не подошедших ни под одну тему)",
+            variable=self.auto_topics_var,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 6))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=3, column=0, sticky="ew", padx=10, pady=(14, 0))
@@ -581,6 +642,15 @@ class SettingsTab(ctk.CTkFrame):
             kw_entry.insert(0, keywords)
         self._topic_rows.append(entry)
 
+    def _add_default_topics(self) -> None:
+        """Add the ready-made topics that are not in the list yet (by name)."""
+        from config import default_topics
+
+        have = {e["name"].get().strip().lower() for e in self._topic_rows}
+        for t in default_topics():
+            if t.name.lower() not in have:
+                self._add_topic_row(t.name, ", ".join(t.keywords))
+
     def _collect_topics(self) -> list[TopicConfig]:
         topics = []
         for entry in self._topic_rows:
@@ -605,6 +675,7 @@ class SettingsTab(ctk.CTkFrame):
         self.threshold_entry.insert(0, str(config.similarity_threshold))
         self.interval_entry.delete(0, "end")
         self.interval_entry.insert(0, str(config.check_interval_minutes))
+        self.auto_topics_var.set(bool(config.auto_topics))
         self.refresh_channels()
 
     def refresh_channels(self) -> None:
@@ -723,6 +794,7 @@ class SettingsTab(ctk.CTkFrame):
             topics=topics,
             interest_examples=examples,
             channels=channels,
+            auto_topics=bool(self.auto_topics_var.get()),
         )
         save_app_config(new_config)
         logger.info(
@@ -986,7 +1058,12 @@ class DigestApp(ctk.CTk):
                 continue
             existing.add(key)
             new_posts.append(scored)
-            card = PostCard(self.feed_frame, scored)
+            card = PostCard(
+                self.feed_frame, scored, on_move=self._move_card,
+                topic_names=[t.name for t in self.config.topics],
+                on_channel=self._set_channel_topic,
+                on_confirm=self._confirm_card, on_reject=self._reject_card,
+            )
             self._feed_cards.insert(0, card)
             if card.topic not in self._topics:
                 self._topics.append(card.topic)
@@ -1053,6 +1130,76 @@ class DigestApp(ctk.CTk):
 
     def _on_topic_selected(self, _choice: str) -> None:
         self._render_feed()
+
+    def _move_card(self, card, topic: str) -> None:
+        """User says: this post belongs to <topic> (or to none). Moves the
+        card and remembers the correction -- it becomes an example for the
+        local LLM on the next checks."""
+        from embed_filter import FilterResult
+
+        post = card.scored.post
+        if topic == OTHER_TOPIC:
+            card.scored.result = FilterResult(False, 0.0, None, "вручную")
+            saved = ""
+        else:
+            example = next((t.as_example() for t in self.config.topics if t.name == topic), topic)
+            card.scored.result = FilterResult(True, 0.95, example, "вручную")
+            saved = topic
+        card.topic = topic_label(card.scored)
+        card._built = False  # re-render with the new chips
+        try:
+            if self.storage and post.text.strip():
+                self.storage.add_feedback(post.text, saved)
+        except Exception:
+            logger.debug("не удалось сохранить правку", exc_info=True)
+        self._refresh_topic_menu()
+        self._render_feed()
+        self.status_bar.configure(
+            text=f"Запомнил: «{_short(post.text, 40)}» → {topic}. Учту при следующих проверках."
+        )
+
+    def _confirm_card(self, card) -> None:
+        """👍 the topic shown on the card is right: remember it as an example."""
+        self._move_card(card, card.topic)
+
+    def _reject_card(self, card) -> None:
+        """👎 the post does not belong to the shown topic: remember it as 'not interesting'."""
+        self._move_card(card, OTHER_TOPIC)
+
+    def _set_channel_topic(self, card, topic: str) -> None:
+        """User says: this whole channel belongs to <topic>. Remembered for
+        good; all of the channel's posts in the feed that were not placed by
+        hand move there too, and future posts without a clear topic land there."""
+        from embed_filter import FilterResult
+
+        post = card.scored.post
+        try:
+            if self.storage:
+                self.storage.set_channel_category(post.channel_id, topic, "manual")
+        except Exception:
+            logger.debug("не удалось сохранить категорию канала", exc_info=True)
+        example = next((t.as_example() for t in self.config.topics if t.name == topic), topic)
+        moved = 0
+        for c in self._feed_cards:
+            sp = c.scored
+            if sp.post.channel_id != post.channel_id or sp.result.source == "вручную":
+                continue
+            if sp.result.source in ("ИИ", "ИИ-фото") and c.topic == topic:
+                continue
+            if c.topic == topic:
+                continue
+            # strong engine verdicts (keywords/LLM) for another topic are kept
+            if sp.result.is_relevant and sp.result.source in ("ИИ", "ИИ-фото", "слова"):
+                continue
+            sp.result = FilterResult(True, max(sp.result.score, 0.5), example, "канал")
+            c.topic = topic_label(sp)
+            c._built = False
+            moved += 1
+        self._refresh_topic_menu()
+        self._render_feed()
+        self.status_bar.configure(
+            text=f"Канал «{_short(post.channel_title or '', 30)}» → «{topic}». Перенесено постов: {moved}."
+        )
 
     GROUP_PAGE = 20
 
@@ -1178,7 +1325,7 @@ class DigestApp(ctk.CTk):
                 text = summarize_topic(topic, texts, model, url)
                 self._llm_results.put((topic, text or "(пустой ответ)", True))
             except Exception as e:
-                logger.error("Сводка не удалась (Ollama запущен? модель скачана?): %s", e)
+                logger.error("Сводка не удалась (ИИ-модель не загружена?): %s", e)
                 self._llm_results.put((topic, f"Не удалось получить сводку: {e}", False))
 
         threading.Thread(target=job, daemon=True).start()
@@ -1215,6 +1362,19 @@ class DigestApp(ctk.CTk):
             self.status_bar.configure(text=event.status, text_color=("black", "white"))
             if event.status == "Ожидание" or event.status.startswith("Найдено каналов"):
                 self.settings_tab.refresh_channels()  # channel list is now in storage
+        elif event.type == "topics_added":
+            try:
+                self.config = load_app_config()
+                set_active_config(self.config)
+                self.settings_tab.load(self.config)
+            except Exception:
+                logger.exception("Не удалось обновить список тем")
+            self.clear_feed()  # regroup everything under the new topics
+            self.status_bar.configure(
+                text="Создана новая тема: " + ", ".join(f"«{n}»" for n in event.new_topics)
+                + ". Её можно переименовать или удалить в Настройках.",
+                text_color=("black", "white"),
+            )
         elif event.type == "error" and event.error:
             self.status_bar.configure(
                 text=f"Ошибка: {event.error}\n(подробности во вкладке «Журнал»)",

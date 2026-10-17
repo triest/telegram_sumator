@@ -1,7 +1,12 @@
 # Copy this file to config.yaml and edit.
 
 check_interval_minutes: 40
-similarity_threshold: 0.48
+# Порог привязан к модели: Qwen3-Embedding ~0.62, старая MiniLM ~0.38.
+similarity_threshold: 0.62
+
+# Локальная модель смысла (скачивается один раз). Лучшая точность на реальных постах
+# (0.85 против 0.70 у MiniLM). Для слабых устройств: paraphrase-multilingual-MiniLM-L12-v2 (порог ~0.38)
+embedding_model: "Qwen/Qwen3-Embedding-0.6B"
 
 # Where to store data (relative to project root, created automatically)
 db_path: "data/digest.db"
@@ -39,7 +44,10 @@ max_concurrent: 6         # channels fetched in parallel
 # --- Optional local LLM (Ollama) for topic summaries ("Сводка (ИИ)" button) ---
 # Install Ollama (ollama.com), run `ollama pull qwen2.5:3b`, then set:
 # llm_model: "qwen2.5:3b"
-llm_model: ""
+# "embedded" = маленькая модель внутри приложения (скачается один раз, ~2 ГБ)
+# embedded_model: qwen2.5-1.5b-instruct-q4_k_m.gguf   # полегче, для слабых ПК
+# embedded_repo: Qwen/Qwen2.5-1.5B-Instruct-GGUF
+llm_model: "embedded"
 llm_url: "http://localhost:11434"
 
 # Only posts you have NOT read in Telegram yet (recommended).
@@ -52,3 +60,8 @@ only_unread: true
 #     keywords: ["LLM", "GPT", "Claude", "новые модели"]
 #   - name: "Стартапы"
 #     keywords: ["инвестиции", "раунд", "продукт"]
+
+# Сам создавать новые темы из групп похожих постов, не подошедших ни под одну тему
+# (название предлагает встроенная модель). Включается и в Настройках.
+auto_topics: false
+auto_topics_min_posts: 4

@@ -43,3 +43,8 @@ android/captures/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# temp
+_apk_parts/
+
+models/

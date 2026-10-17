@@ -14,21 +14,28 @@ Build a personal Telegram channel digest tool that:
 - Model must be small enough to run on a mid-range Android phone (CPU).
 
 ## Preferred Local Model Approach
-**Primary: Embedding + Cosine Similarity**
+**Primary: Embedding + Cosine Similarity** (measured on real posts from the user's channels:
+overall accuracy 0.85 vs 0.70 for the old MiniLM, see skill `.claude/skills/digest-recognition`)
 
-- Library: `sentence-transformers`
-- Recommended model: `paraphrase-multilingual-MiniLM-L12-v2` (or `intfloat/multilingual-e5-small`)
-- User provides 5–20 example texts of “what is interesting to me”.
-- For each new post:
-  - Compute embedding
-  - Calculate max cosine similarity to user examples
-  - If similarity ≥ threshold (default 0.45–0.55) → show it
-- Score = similarity score
-- Preview = first 250 characters of the post
+- Library: `sentence-transformers`, model `Qwen/Qwen3-Embedding-0.6B` (config `embedding_model`).
+  The old `paraphrase-multilingual-MiniLM-L12-v2` still works (threshold ~0.38) for weak devices.
+- Posts are encoded with a task instruction prefix; topics are compared by their **name only**
+  (keywords are matched exactly by `TopicKeywordBoost`). Default `similarity_threshold` 0.62.
+- Thresholds are **model-specific**: changing the model means re-tuning the threshold.
+- For each new post: max cosine similarity to the topics -> if >= threshold -> show it.
+- Channel context: per-topic baseline from `NEUTRAL_PROBES` is subtracted, a channel gets a "home"
+  topic only with a clear margin (generic topics like "кино" otherwise attract everything).
+- Manual verdicts (👍 Верно / 👎 Не то / move to topic) are stored in SQLite `feedback` and applied
+  to near-identical posts (cosine >= 0.85).
+- Pictures: local CLIP (`image_topics.py`, multilingual text encoder) for picture-only / short-caption posts.
+- Auto topics (`auto_topics: true`): posts that fit no topic are clustered; a big enough group becomes
+  a new topic (name from the embedded LLM, keywords from the group).
+- Preview = first 250 characters of the post. Everything runs in-process: **no Ollama**.
 
-**Optional fallback**: pure keyword/regex filter if model is not downloaded.
+**Embedded LLM** (llama-cpp-python GGUF, only for "Сводка (ИИ)" and naming auto topics). It is NOT used
+for classification (`llm_classify: false`): on real posts it was worse than embeddings (61% vs 85%) and slow on CPU.
 
-**Future optional**: tiny GGUF generative model via llama-cpp-python (Phi-3-mini / Qwen2-1.5B) for yes/no + summary. Not required for MVP.
+**Fallback**: pure keyword/regex filter if the model is not downloaded.
 
 ## Tech Stack
 - Python 3.11+

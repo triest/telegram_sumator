@@ -19,7 +19,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from config import ConfigError, load_app_config, load_credentials, resolve_path
+from config import (
+    ConfigError,
+    TopicConfig,
+    load_app_config,
+    load_credentials,
+    resolve_path,
+    save_app_config,
+)
 from embed_filter import build_filter
 from pipeline import ScoredPost, check_once
 from storage import Storage
@@ -27,7 +34,7 @@ from telegram_client import TelegramDigestClient
 
 logger = logging.getLogger(__name__)
 
-WorkerEventType = Literal["status", "posts", "error", "ask"]
+WorkerEventType = Literal["status", "posts", "error", "ask", "topics_added"]
 
 
 @dataclass
@@ -36,6 +43,7 @@ class WorkerEvent:
     status: Optional[str] = None
     posts: list[ScoredPost] = field(default_factory=list)
     error: Optional[str] = None
+    new_topics: list[str] = field(default_factory=list)  # for "topics_added"
     # For type == "ask": text shown in the input dialog, and whether to mask.
     prompt: Optional[str] = None
     secret: bool = False
@@ -135,6 +143,7 @@ class DigestWorker(threading.Thread):
                 examples,
                 threshold=app_config.similarity_threshold,
                 device=app_config.embedding_device,
+                model_name=app_config.embedding_model,
                 topics=app_config.topics,
                 llm_model=app_config.llm_model if app_config.llm_classify else "",
                 llm_url=app_config.llm_url,
@@ -196,6 +205,12 @@ class DigestWorker(threading.Thread):
                     self._check_now_event.clear()
                     self._emit_status("Проверка новых постов...")
                     try:
+                        # manual corrections become examples for the LLM
+                        if hasattr(relevance_filter, "set_feedback"):
+                            fb = storage.list_feedback()
+                            if fb != getattr(relevance_filter, "feedback", None):
+                                relevance_filter.set_feedback(fb)
+                        unplaced: list[str] = []
                         scored = await check_once(
                             client=client,
                             storage=storage,
@@ -205,10 +220,13 @@ class DigestWorker(threading.Thread):
                             progress=lambda d, t: self._emit_status(
                                 f"Проверка каналов: {d}/{t}"
                             ),
+                            unplaced_out=unplaced if app_config.auto_topics else None,
                         )
                         last_check = time.monotonic()
                         if scored:
                             self.events.put(WorkerEvent(type="posts", posts=scored))
+                        if app_config.auto_topics:
+                            await self._auto_create_topics(app_config, relevance_filter, unplaced)
                         self._emit_status("Ожидание")
                     except Exception as e:
                         logger.exception("Check failed")
@@ -225,6 +243,7 @@ class DigestWorker(threading.Thread):
                             app_config.all_examples(),
                             threshold=app_config.similarity_threshold,
                             device=app_config.embedding_device,
+                model_name=app_config.embedding_model,
                             topics=app_config.topics,
                             llm_model=app_config.llm_model if app_config.llm_classify else "",
                             llm_url=app_config.llm_url,
@@ -242,6 +261,47 @@ class DigestWorker(threading.Thread):
 
         storage.close()
         self._emit_status("Остановлено")
+
+    async def _auto_create_topics(self, app_config, relevance_filter, unplaced: list[str]) -> None:
+        """Group the posts no topic fit; every big enough group becomes a new topic."""
+        if len(unplaced) < app_config.auto_topics_min_posts or not hasattr(relevance_filter, "embed_texts"):
+            return
+        from auto_topics import discover_topics
+
+        namer = None
+        if app_config.llm_model:
+            from llm import suggest_topic_name
+
+            namer = lambda sample, existing: suggest_topic_name(  # noqa: E731
+                sample, existing, app_config.llm_model, app_config.llm_url
+            )
+        self._emit_status("Ищу новые темы среди неподошедших постов...")
+        found = await asyncio.to_thread(
+            discover_topics,
+            unplaced,
+            relevance_filter.embed_texts,
+            [t.name for t in app_config.topics],
+            namer,
+            app_config.auto_topics_min_posts,
+            2,
+            relevance_filter.topic_name_vectors(),
+        )
+        if not found:
+            return
+        # re-read the file: the user may have edited topics in Settings meanwhile
+        fresh = load_app_config()
+        known = {t.name.lower() for t in fresh.topics}
+        added = [t for t in found if t.name.lower() not in known]
+        if not added:
+            return
+        for t in added:
+            fresh.topics.append(TopicConfig(name=t.name, keywords=t.keywords))
+            logger.info(
+                "Новая тема «%s» (постов: %d), слова: %s", t.name, len(t.members), ", ".join(t.keywords)
+            )
+        save_app_config(fresh)
+        self.events.put(WorkerEvent(type="topics_added", new_topics=[t.name for t in added]))
+        self._reload_event.set()  # rebuild the filter with the new topics and rescan
 
     def _emit_status(self, status: str) -> None:
         logger.info("Статус: %s", status)

@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS channel_profile (
     updated      REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS channel_category (
+    channel_id INTEGER PRIMARY KEY,
+    topic      TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'auto',  -- auto | manual
+    updated    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    text_hash TEXT PRIMARY KEY,
+    text      TEXT NOT NULL,
+    topic     TEXT NOT NULL,   -- topic name, or '' = "none of the topics"
+    ts        REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -132,6 +146,53 @@ class Storage:
             )
             for r in cur.fetchall()
         ]
+
+    # -- manual corrections: "this post belongs to topic X" -------------
+    def add_feedback(self, text: str, topic: str) -> None:
+        import hashlib
+        import time
+
+        h = hashlib.md5(text.strip().encode("utf-8")).hexdigest()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO feedback(text_hash, text, topic, ts) VALUES (?,?,?,?)",
+                (h, text.strip()[:600], topic, time.time()),
+            )
+
+    def list_feedback(self, limit: int = 200) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT text, topic FROM feedback ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [(r["text"], r["topic"]) for r in rows]
+
+    # -- channel home category: which topic a channel belongs to ------
+    def get_channel_category(self, channel_id: int):
+        """(topic, source) or None."""
+        r = self._conn.execute(
+            "SELECT topic, source FROM channel_category WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        return (r["topic"], r["source"]) if r else None
+
+    def set_channel_category(self, channel_id: int, topic: str, source: str = "auto") -> None:
+        import time
+
+        with self._conn:
+            if source == "auto":  # never overwrite the user's own choice
+                self._conn.execute(
+                    "INSERT INTO channel_category(channel_id, topic, source, updated) VALUES (?,?,?,?) "
+                    "ON CONFLICT(channel_id) DO UPDATE SET topic=excluded.topic, updated=excluded.updated "
+                    "WHERE channel_category.source != 'manual'",
+                    (channel_id, topic, source, time.time()),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO channel_category(channel_id, topic, source, updated) VALUES (?,?,?,?)",
+                    (channel_id, topic, source, time.time()),
+                )
+
+    def clear_channel_category(self, channel_id: int) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM channel_category WHERE channel_id=?", (channel_id,))
 
     # -- channel topic profile (what a channel usually posts about) ----
     def get_profile(self, channel_id: int):

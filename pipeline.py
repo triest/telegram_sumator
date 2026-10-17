@@ -29,6 +29,34 @@ class ScoredPost:
     result: FilterResult
 
 
+# thresholds for a channel's "home" topic (similarity above the neutral baseline)
+HOME_MIN_TOP = 0.09
+HOME_MIN_GAP = 0.035
+
+NEUTRAL_PROBES = [
+    "Сегодня ходил в магазин, купил хлеб и молоко, потом гулял по парку",
+    "Скидка 30% на всё до конца недели, промокод в описании, успейте оформить заказ",
+    "Рецепт простого супа: нарезать овощи, залить бульоном и варить двадцать минут",
+    "Курс валют на сегодня, нефть подешевела, аналитики ждут решения регулятора",
+    "Мы переехали в новую квартиру, делаю ремонт, показываю как получилось",
+    "Прогноз погоды на выходные: облачно, местами дожди, температура около десяти градусов",
+    "Матч закончился со счётом два один, тренер доволен игрой команды",
+    "Как справиться со стрессом на работе: пять советов психолога",
+    "Новый смартфон получил улучшенную камеру и батарею на два дня работы",
+    "Всем привет! Спасибо что вы со мной, завтра будет новый пост, оставайтесь на связи",
+    "Доброе утро! Хорошего дня и отличного настроения всем подписчикам",
+    "Мэр объявил о ремонте дорог и благоустройстве двора в этом районе",
+    "Розыгрыш призов среди подписчиков, условия в закреплённом сообщении",
+    "Приходите на встречу в субботу, начало в шесть вечера, вход свободный",
+    "Мой кот сегодня опять устроил беспорядок на кухне, смотрите видео",
+    "Выставка современного искусства открывается в городском музее на следующей неделе",
+    "Сколько стоит содержать автомобиль: страховка, топливо, обслуживание",
+    "Вакансия: требуется менеджер по продажам, график пять на два, оформление по ТК",
+    "Рассказываю о поездке на выходные: дорога, гостиница, что понравилось",
+    "Полезный совет: как выбрать хороший матрас и не переплатить",
+]
+
+
 async def check_once(
     client: TelegramDigestClient,
     storage: Storage,
@@ -36,6 +64,7 @@ async def check_once(
     relevance_filter,
     limit_per_channel: int = 200,
     progress: Optional[Callable[[int, int], None]] = None,
+    unplaced_out: Optional[list[str]] = None,
 ) -> list[ScoredPost]:
     """Run one fetch+filter pass over all watched channels.
 
@@ -85,9 +114,39 @@ async def check_once(
     # toward the channel's usual topics and as a hint for the LLM.
     ctx_weight = app_config.channel_context_weight
     use_ctx = ctx_weight > 0 and hasattr(relevance_filter, "topic_matrix")
-    sig = hashlib.md5("|".join(app_config.all_examples()).encode("utf-8")).hexdigest()
+    # (the model is part of the signature: profiles made by another model are not comparable)
+    sig = hashlib.md5(
+        ("|".join(app_config.all_examples()) + "#" + app_config.embedding_model).encode("utf-8")
+    ).hexdigest()
+    # Some topics (short generic names like "кино") are similar to almost any text. Their
+    # typical similarity to neutral posts is subtracted, otherwise such a topic becomes
+    # the "home" of every channel that has no clear subject.
+    baseline = None
+    if use_ctx:
+        try:
+            probe = await asyncio.to_thread(relevance_filter.topic_matrix, NEUTRAL_PROBES)
+            if probe is not None and len(probe):
+                baseline = np.asarray(probe, dtype=float).mean(axis=0)
+        except Exception as e:
+            logger.debug("topic baseline failed: %s", e)
     PROFILE_TTL = 7 * 86400
     PROFILE_SAMPLE = 25
+
+    topic_names = [t.name for t in app_config.topics]
+    example_by_name = {t.name: t.as_example() for t in app_config.topics}
+    force = bool(getattr(app_config, "force_category", True)) and bool(topic_names)
+    home_auto: dict[int, str] = {}  # channel_id -> category inferred from the channel's profile
+
+    def channel_topic_of(ch) -> str:
+        """The channel's own category: the user's choice, else the inferred one."""
+        stored = storage.get_channel_category(ch.channel_id)
+        if stored and stored[1] == "manual" and stored[0] in example_by_name:
+            return stored[0]
+        if ch.channel_id in home_auto:
+            name = home_auto[ch.channel_id]
+        else:
+            name = stored[0] if stored else ""
+        return name if name in example_by_name else ""
 
     thumbs_dir = resolve_path("cache/thumbs")
     img_sem = asyncio.Semaphore(4)
@@ -131,6 +190,19 @@ async def check_once(
                 vec = matrix.mean(axis=0).tolist()
                 storage.set_profile(ch.channel_id, sig, vec, now)
             v = np.asarray(vec, dtype=float)
+            if baseline is not None and len(baseline) == len(v):
+                v = v - baseline
+            if topic_names and len(v) >= len(topic_names):
+                tv = v[: len(topic_names)]
+                order = np.argsort(-tv)
+                home = topic_names[int(order[0])]
+                if baseline is not None and len(order) > 1:
+                    # a channel gets a "home" topic only when one topic is clearly ahead;
+                    # otherwise (a personal blog, a mix) its posts are not pushed into one
+                    if tv[order[0]] < HOME_MIN_TOP or tv[order[0]] - tv[order[1]] < HOME_MIN_GAP:
+                        home = ""
+                home_auto[ch.channel_id] = home
+                storage.set_channel_category(ch.channel_id, home, "auto")
             prior = np.clip((v - v.mean()) * ctx_weight, -0.15, 0.2)
             return prior
         except Exception as e:
@@ -189,16 +261,41 @@ async def check_once(
                             )
                         for c, path in zip(need, got):
                             c.image_path = path
+                    home_topic = channel_topic_of(ch)
                     async with score_lock:
                         results = await asyncio.to_thread(
                             lambda: relevance_filter.score_batch(
                                 [p.text for p in candidates],
                                 prior=prior,
                                 channel_title=ch.title or "",
+                                channel_topic=home_topic,
                                 images=[c.image_path for c in candidates],
                             )
                         )
                     fresh = []
+                    if unplaced_out is not None:
+                        # posts no topic fit (before the "every post gets a category" fallback)
+                        unplaced_out.extend(
+                            p.text for p, r in zip(candidates, results)
+                            if not r.is_relevant and r.source != "вручную" and p.text.strip()
+                        )
+                    if force:
+                        # Every channel fits one of the topics: whatever no engine could
+                        # place goes to the channel's own topic (or the closest one).
+                        fixed = []
+                        for r in results:
+                            if r.is_relevant or r.source == "вручную":
+                                fixed.append(r)
+                                continue
+                            # only a channel with a clear home topic forces its posts there;
+                            # "closest topic" is NOT used (a generic topic attracts everything)
+                            ex = example_by_name.get(home_topic)
+                            if ex:
+                                fixed.append(FilterResult(True, max(r.score, 0.35), ex, "канал"))
+                                stats["forced"] = stats.get("forced", 0) + 1
+                            else:
+                                fixed.append(r)
+                        results = fixed
                     for post, result in zip(candidates, results):
                         if not result.is_relevant:
                             stats["best_miss"] = max(stats["best_miss"], result.score)
@@ -238,6 +335,9 @@ async def check_once(
             "ИИ-проверка (LLM): запросов к модели %d, из кэша %d; подтверждено %d, отклонено %d",
             ls["calls"], ls["cached"], ls["accepted"], ls["rejected"],
         )
+    logger.info(
+        "Отнесено к категории канала (без явного совпадения): %d", stats.get("forced", 0)
+    )
     logger.info(
         "Непрочитанных постов проверено: %d (исключено стоп-словами: %d), подошло: %d. "
         "Лучший балл среди НЕ подошедших: %.2f (порог %.2f)",

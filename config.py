@@ -68,6 +68,28 @@ class TopicConfig:
         return self.name
 
 
+DEFAULT_TOPICS: list[tuple[str, list[str]]] = [
+    ("СВО", ["специальная военная операция", "СВО", "фронт", "наступление", "Минобороны", "ВСУ",
+             "ВС РФ", "сводка", "беспилотники", "ракетный удар", "штурм"]),
+    ("Авиация", ["самолёты", "авиация", "авиакомпании", "аэропорты", "пилоты", "рейс",
+                 "Boeing", "Airbus", "Су-57", "МС-21", "авиапроисшествия", "ВКС"]),
+    ("Походы и туризм", ["поход", "туризм", "горы", "треккинг", "палатка", "маршрут",
+                         "рюкзак", "байдарка", "рафтинг", "восхождение", "путешествие"]),
+    ("Программирование", ["Python", "программирование", "разработка", "код", "GitHub",
+                          "библиотека", "фреймворк", "релиз", "open-source", "баг", "API"]),
+    ("ИИ и нейросети", ["нейросеть", "искусственный интеллект", "LLM", "GPT", "Claude",
+                        "ChatGPT", "модель", "машинное обучение", "OpenAI", "генерация изображений"]),
+    ("Кино и сериалы", ["фильм", "сериал", "кино", "трейлер", "премьера", "режиссёр", "актёр", "кинотеатр"]),
+    ("Фантастика", ["фантастика", "научная фантастика", "фэнтези", "космос", "киберпанк",
+                    "постапокалипсис", "роман"]),
+    ("История", ["история", "исторический", "война", "древний", "империя", "археология", "эпоха"]),
+]
+
+
+def default_topics() -> list["TopicConfig"]:
+    return [TopicConfig(name=n, keywords=list(k)) for n, k in DEFAULT_TOPICS]
+
+
 def parse_topics_text(text: str) -> list[TopicConfig]:
     """'Название: слово1, слово2' per line -> topics (keywords optional)."""
     topics: list[TopicConfig] = []
@@ -113,7 +135,8 @@ class TelegramCredentials:
 @dataclass
 class AppConfig:
     check_interval_minutes: int = 40
-    similarity_threshold: float = 0.48
+    similarity_threshold: float = 0.62  # tuned for Qwen3-Embedding (MiniLM needs ~0.38)
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     db_path: str = "data/digest.db"
     # "auto" (default): use CUDA on PC if available, CPU on Termux/Android
     # (no CUDA there). "cuda" / "cpu" force a specific device.
@@ -133,6 +156,13 @@ class AppConfig:
     channel_context_weight: float = 1.0  # 0 = off; how strongly a channel's usual topics bias its posts
     show_images: bool = True  # download pictures from matching posts
     llm_classify: bool = True  # let the LLM verify/assign topics when llm_model is set
+    # True: every post gets one of the topics (the channel's own topic if nothing matches),
+    # so "Прочее" stays almost empty. False: old behaviour with a "none" verdict.
+    force_category: bool = True
+    embedded_model: str = ""  # GGUF file name for llm_model="embedded" ("" = built-in default)
+    embedded_repo: str = ""   # HuggingFace repo of that file ("" = default)
+    auto_topics: bool = False  # create new topics itself for groups of posts that fit none
+    auto_topics_min_posts: int = 4  # how many similar unplaced posts make a new topic
 
 
 def _all_examples(self) -> list[str]:
@@ -331,10 +361,14 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         elif isinstance(t, str) and t.strip():
             topics.extend(parse_topics_text(t))
 
-    return AppConfig(
+    if not topics:  # first launch / empty list: start with ready-made topics
+        topics = default_topics()
+
+    cfg = AppConfig(
         topics=topics,
         check_interval_minutes=int(raw.get("check_interval_minutes", 40)),
-        similarity_threshold=float(raw.get("similarity_threshold", 0.48)),
+        similarity_threshold=float(raw.get("similarity_threshold", 0.62)),
+        embedding_model=str(raw.get("embedding_model", "") or "Qwen/Qwen3-Embedding-0.6B"),
         db_path=str(raw.get("db_path", "data/digest.db")),
         embedding_device=str(raw.get("embedding_device", "auto")),
         interest_examples=list(raw.get("interest_examples") or []),
@@ -349,7 +383,21 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         llm_classify=bool(raw.get("llm_classify", True)),
         show_images=bool(raw.get("show_images", True)),
         channel_context_weight=float(raw.get("channel_context_weight", 1.0)),
+        force_category=bool(raw.get("force_category", True)),
+        embedded_model=str(raw.get("embedded_model", "") or ""),
+        embedded_repo=str(raw.get("embedded_repo", "") or ""),
+        auto_topics=bool(raw.get("auto_topics", False)),
+        auto_topics_min_posts=max(3, int(raw.get("auto_topics_min_posts", 4))),
     )
+    try:
+        import llm as _llm
+
+        _llm.configure_embedded(
+            cfg.embedded_repo, cfg.embedded_model, str(resolve_path("models"))
+        )
+    except Exception:
+        pass
+    return cfg
 
 
 def resolve_path(relative: str) -> Path:
@@ -371,6 +419,7 @@ def save_app_config(config: AppConfig, config_path: Path = DEFAULT_CONFIG_PATH) 
     raw = {
         "check_interval_minutes": config.check_interval_minutes,
         "similarity_threshold": config.similarity_threshold,
+        "embedding_model": config.embedding_model,
         "db_path": config.db_path,
         "embedding_device": config.embedding_device,
         "topics": [{"name": t.name, "keywords": list(t.keywords)} for t in config.topics],
@@ -397,6 +446,11 @@ def save_app_config(config: AppConfig, config_path: Path = DEFAULT_CONFIG_PATH) 
         "llm_classify": config.llm_classify,
         "show_images": config.show_images,
         "channel_context_weight": config.channel_context_weight,
+        "force_category": config.force_category,
+        "embedded_model": config.embedded_model,
+        "embedded_repo": config.embedded_repo,
+        "auto_topics": config.auto_topics,
+        "auto_topics_min_posts": config.auto_topics_min_posts,
     }
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as f:

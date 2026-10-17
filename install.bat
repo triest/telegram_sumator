@@ -162,6 +162,14 @@ if errorlevel 1 (
 )
 
 echo.
+echo Ставлю встроенную ИИ-модель ^(llama-cpp-python, готовая сборка без компилятора^)...
+pip install llama-cpp-python --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+if errorlevel 1 (
+    echo [!] Встроенный ИИ не установился. Это не страшно: приложение будет работать
+    echo     по смыслу и ключевым словам, а категория канала берётся из его профиля.
+)
+
+echo.
 if not exist ".env" (
     copy ".env.example" ".env" >nul
     echo Создан файл .env

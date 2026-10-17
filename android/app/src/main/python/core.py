@@ -177,17 +177,30 @@ def _kw_hits(text_low, keywords):
 
 _PROMPT = (
     "Ты классификатор постов Telegram. Темы:\n{topics}\n\n"
+    "{examples}"
     "Канал: {channel}\nПост:\n{text}\n\n"
-    "Выбери ОДНУ тему, только если она — ГЛАВНЫЙ предмет поста. Реклама, розыгрыши, шутки, "
-    "побочные упоминания и другие сферы — ответь: нет. При сомнении — нет. "
+    "Выбери ОДНУ тему, которая заметно присутствует в посте (не мимоходом одним словом); "
+    "если подходят несколько — ближайшую. Реклама, розыгрыши, шутки и посты про другое — ответь: нет. "
     "Ответь только названием темы."
 )
 
 
-def _llm_pick(helper, topics, channel, text):
+def _llm_pick(helper, topics, channel, text, feedback=None):
+    ex = ""
+    if feedback:
+        words = {w for w in re.findall(r"\w+", text.lower()) if len(w) > 3}
+        scored = []
+        for f in feedback:
+            fw = {w for w in re.findall(r"\w+", f["text"].lower()) if len(w) > 3}
+            scored.append((len(words & fw) / (len(words | fw) or 1), f))
+        scored.sort(key=lambda x: -x[0])
+        picked = [f for ov, f in scored[:5] if ov > 0] or [f for _, f in scored[:2]]
+        ex = "Примеры того, как пользователь сам разметил посты:\n" + "\n".join(
+            f"- «{' '.join(f['text'].split())[:180]}» → {f.get('topic') or 'нет'}" for f in picked
+        ) + "\n\n"
     prompt = _PROMPT.format(
         topics="\n".join(f"- {t['name']}: {', '.join(t['keywords'][:8])}" for t in topics),
-        channel=channel, text=text[:700],
+        examples=ex, channel=channel, text=text[:700],
     )
     ans = (helper.classify(prompt) or "").strip().lower()
     for t in topics:
@@ -202,9 +215,9 @@ async def _scan(settings, helper):
     topics = [t for t in settings.get("topics", []) if t.get("name")]
     blacklist = set(int(x) for x in settings.get("blacklist", []))
     limit = int(settings.get("per_channel_limit", 40))
-    threshold = float(settings.get("threshold", 0.42))
+    threshold = float(settings.get("threshold", 0.35))
     use_llm = bool(settings.get("use_llm", True)) and helper.hasLlm()
-    budget = int(settings.get("llm_budget", 30))
+    budget = int(settings.get("llm_budget", 60))
     only_broadcast = bool(settings.get("only_broadcast", True))
     images = bool(settings.get("show_images", True))
     use_emb = helper.hasEmbed() and _sp is not None and bool(topics)
@@ -255,6 +268,8 @@ async def _scan(settings, helper):
             result.append(p)
     else:
         sims = None
+        fb = [f for f in settings.get("feedback", []) if f.get("text")][:120]
+        fb_topic_idx = {t["name"]: k for k, t in enumerate(topics)}
         if use_emb:
             try:
                 tvec = _embed(helper, [f"{t['name']}: {', '.join(t['keywords'])}" for t in topics])
@@ -265,11 +280,41 @@ async def _scan(settings, helper):
                     pvec.append(_embed(helper, [p["text"] for p in posts[i:i + B]]))
                 pvec = np.vstack(pvec) if pvec else np.zeros((0, tvec.shape[1]), np.float32)
                 sims = pvec @ tvec.T if len(posts) else np.zeros((0, len(topics)))
+                sims = np.array(sims, dtype=np.float32)
+
+                # 1) the user's manual corrections act as extra examples (nearest neighbour)
+                veto = np.zeros(len(posts), dtype=bool)
+                if fb and len(posts):
+                    helper.progress("Учитываю ваши правки…")
+                    fvec = _embed(helper, [f["text"] for f in fb])
+                    fs = pvec @ fvec.T  # (posts, feedback)
+                    for k, f in enumerate(fb):
+                        col = fs[:, k]
+                        if f.get("topic") in fb_topic_idx:
+                            jx = fb_topic_idx[f["topic"]]
+                            sims[:, jx] = np.maximum(sims[:, jx], np.where(col >= 0.55, 0.15 + col * 0.9, 0))
+                        else:
+                            veto |= col >= 0.88  # "none of the topics" example
+
+                # 2) channel context: what this channel mostly posts about (from its own
+                # posts in this pass) nudges the scores towards its usual topics
+                if len(posts):
+                    by_ch = {}
+                    for idx, p in enumerate(posts):
+                        by_ch.setdefault(p["channel_id"], []).append(idx)
+                    gmean = sims.mean(axis=0)
+                    for idxs in by_ch.values():
+                        if len(idxs) >= 4:
+                            prior = np.clip((sims[idxs].mean(axis=0) - gmean) * 1.0, -0.10, 0.15)
+                            sims[idxs] += prior
             except Exception as e:  # model failure -> keyword-only
                 helper.progress(f"Эмбеддинги недоступны ({e}), только ключевые слова")
                 sims = None
+                veto = None
+        else:
+            veto = None
 
-        cands = []  # (distance_to_accept, idx, topic) for LLM
+        cands = []  # (distance_to_threshold, idx, topic) for the LLM
         for i, p in enumerate(posts):
             low = p["text"].lower()
             best_name, best, hits_best = None, -1.0, 0
@@ -277,7 +322,7 @@ async def _scan(settings, helper):
                 h = _kw_hits(low, t["keywords"])
                 s = float(sims[i, j]) if sims is not None else 0.0
                 s += min(0.3, 0.12 * h)
-                if s > best:
+                if s > best or (s == best and h > hits_best):
                     best, best_name, hits_best = s, t["name"], h
             p["score"] = round(best, 3)
             if sims is None:
@@ -285,8 +330,11 @@ async def _scan(settings, helper):
                     p.update(topic=best_name, engine="kw")
                     result.append(p)
                 continue
-            if best >= threshold + 0.12 or (hits_best >= 2 and best >= threshold):
-                p.update(topic=best_name, engine="emb")
+            if veto is not None and veto[i] and hits_best == 0:
+                continue  # looks like a post the user marked as "no topic"
+            if hits_best >= 1 or best >= threshold + 0.10:
+                # an explicit keyword match or a clearly high similarity: accept directly
+                p.update(topic=best_name, engine="kw" if hits_best >= 1 and best < threshold + 0.10 else "emb")
                 result.append(p)
             elif best >= threshold - 0.12:
                 cands.append((abs(best - threshold), i, best_name))
@@ -298,7 +346,7 @@ async def _scan(settings, helper):
             for k, (_, i, guess) in enumerate(cands, 1):
                 p = posts[i]
                 try:
-                    pick = await asyncio.to_thread(_llm_pick, helper, topics, p["channel"], p["text"])
+                    pick = await asyncio.to_thread(_llm_pick, helper, topics, p["channel"], p["text"], fb)
                 except Exception:
                     pick = guess if p["score"] >= threshold else None
                 if pick:
@@ -308,7 +356,7 @@ async def _scan(settings, helper):
         else:
             for _, i, guess in cands:
                 p = posts[i]
-                if p["score"] >= threshold:
+                if p["score"] >= threshold - 0.04:
                     p.update(topic=guess, engine="emb")
                     result.append(p)
 
