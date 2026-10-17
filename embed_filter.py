@@ -149,15 +149,36 @@ class EmbeddingFilter:
         if self._instruct:
             self._model.max_seq_length = 512  # bounds memory; posts are cut to ~1000 chars anyway
 
-        self._example_embeddings = self._model.encode(
+        # Instruct models: a topic is described by TWO views averaged: its bare name and
+        # "name: keywords". The name alone fails for acronyms ("СВО") and keywords alone
+        # drag in everything; the average keeps the user's keywords meaningful.
+        name_vecs = self._model.encode(
             [self._doc_text(e) for e in interest_examples],
             convert_to_numpy=True,
-            normalize_embeddings=False,
+            normalize_embeddings=True,
             batch_size=encode_batch_size,
         )
+        if self._instruct:
+            full_vecs = self._model.encode(
+                list(interest_examples),
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=encode_batch_size,
+            )
+            both = name_vecs + full_vecs
+            self._example_embeddings = both / (np.linalg.norm(both, axis=1, keepdims=True) + 1e-12)
+        else:
+            self._example_embeddings = self._model.encode(
+                list(interest_examples),
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+                batch_size=encode_batch_size,
+            )
 
     # A post this similar to one the user already judged gets the same verdict.
     FEEDBACK_SIM = 0.85
+    supports_hits = True
+    kw_bonus = 0.12  # added per exact keyword hit (max 2 hits count)
 
     def set_feedback(self, feedback) -> None:
         """Manual 👍/👎/moves: [(post text, topic or "" = not interesting)]."""
@@ -287,6 +308,11 @@ class EmbeddingFilter:
         sims = _cosine_similarity_matrix(embeddings, self._example_embeddings)
         if prior is not None:
             sims = sims + np.asarray(prior, dtype=float)[None, :]
+        hits = _kw.get("hits")
+        if hits is not None:
+            # exact keyword matches add to the semantic score (they do not replace it)
+            h = np.asarray(hits, dtype=float)[non_empty_idx]
+            sims = sims + self.kw_bonus * np.minimum(h, 2.0)
         for row, i in enumerate(non_empty_idx):
             best_idx = int(np.argmax(sims[row]))
             best_score = float(sims[row][best_idx])
@@ -418,7 +444,19 @@ class TopicKeywordBoost:
     def topic_name_vectors(self):
         return self.base.topic_name_vectors() if hasattr(self.base, "topic_name_vectors") else None
 
+    def _hit_matrix(self, texts: list[str], n_cols: int) -> np.ndarray:
+        h = np.zeros((len(texts), n_cols))
+        for i, t in enumerate(texts):
+            low = t.lower()
+            for k, (_, matchers) in enumerate(self._topics[:n_cols]):
+                h[i, k] = self._hits(low, matchers)
+        return h
+
     def score_batch(self, texts: list[str], **kw) -> list[FilterResult]:
+        if getattr(self.base, "supports_hits", False):
+            # the embedding filter adds keyword hits to its own semantic score
+            n_cols = len(getattr(self.base, "interest_examples", self._topics))
+            return self.base.score_batch(texts, hits=self._hit_matrix(texts, n_cols), **kw)
         results = self.base.score_batch(texts, **kw)
         out = []
         for text, res in zip(texts, results):
@@ -432,7 +470,9 @@ class TopicKeywordBoost:
                 if hits > best_hits:
                     best_ex, best_hits = example, hits
             if best_hits:
-                kw_score = min(0.5 + 0.1 * (best_hits - 1), 0.9)
+                # exact keyword hits are strong evidence: one hit passes the threshold
+                # (scale follows the threshold, it differs between embedding models)
+                kw_score = min(self.threshold + 0.02 + 0.08 * (best_hits - 1), 0.95)
                 if kw_score > res.score:
                     res = FilterResult(
                         is_relevant=kw_score >= self.threshold,

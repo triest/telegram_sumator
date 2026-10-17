@@ -24,6 +24,9 @@ Commit `f55de1c` on `master` (pushed). Details of the architecture are in the `d
 - "Кино" problem: generic one-word topics are attractors; fixed with a neutral-probe baseline and a margin gate; no "closest topic" fallback.
 - Pictures: CLIP (not a VLM) because it is small, in-process and understands Russian topic names via the multilingual text encoder.
 
+## Round 2 (user: "сильно косячит, мимо, пропустил по Украине, косяки с кино")
+Cause: my threshold change broke keyword scoring (СВО = 0 posts) and name-only topics are weak for acronyms. Fixed with keyword bonus + two-view topic doc + richer keywords in config.yaml. Details in `digest-recognition`. Not committed yet at the time of writing.
+
 ## Dead ends (do not repeat)
 - Lowering the cluster threshold (≤0.5) merges unrelated posts; a cohesion check did not help (post embeddings are all fairly close).
 - bge-m3 (needs torch ≥ 2.6), EmbeddingGemma (gated on HuggingFace), multilingual-e5-large (worse than MiniLM on real posts).
