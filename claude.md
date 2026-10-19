@@ -81,11 +81,13 @@ Details (architecture, measured results, how to benchmark, pitfalls) are in the 
 ## Skills in this repo
 Skills load on demand (only their name/description sit in context; the body opens when the task matches):
 - `.claude/skills/digest-recognition` — architecture, measured results and how to benchmark recognition.
+- `.claude/skills/digest-auto-topics` — auto topics: algorithm, constants, live-check recipe, Android port (2026-10-19).
 - `.claude/skills/digest-session-log` — what was decided/done in the 2026-10-17 tuning session; open questions.
 
 ## Open work
-- Port Qwen3-Embedding / feedback / baseline fixes to `termux_main.py` and `android/.../core.py` (only `embedding_model` is wired for Termux).
+- Port Qwen3-Embedding / feedback / baseline fixes to `termux_main.py` (only `embedding_model` is wired for Termux). Android `core.py` already has auto topics (untuned thresholds, Kotlin not compiled).
+- Build the Android APK (no JDK/SDK found on this machine; old `TelegramDigest.apk` predates auto topics).
 - Rebuild the PyInstaller exe (the old `dist` build lacks all recent changes).
 - Validate in the running GUI: 👍/👎 buttons, auto-topics checkbox, CLIP model download on first picture.
-- Auto topics: keywords are weak (generic words); consider merging with similar existing topics (e.g. "Армия" vs "СВО").
+- Auto topics: merge into similar topics is implemented but not yet seen on live data; keywords still sometimes generic (capped at 5).
 - Re-tune `similarity_threshold` (0.62) after the user's own 👍/👎 data accumulates in the `feedback` table.
