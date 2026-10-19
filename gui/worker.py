@@ -34,7 +34,7 @@ from telegram_client import TelegramDigestClient
 
 logger = logging.getLogger(__name__)
 
-WorkerEventType = Literal["status", "posts", "error", "ask", "topics_added"]
+WorkerEventType = Literal["status", "posts", "error", "ask", "topics_added", "topic_suggestions"]
 
 
 @dataclass
@@ -44,6 +44,7 @@ class WorkerEvent:
     posts: list[ScoredPost] = field(default_factory=list)
     error: Optional[str] = None
     new_topics: list[str] = field(default_factory=list)  # for "topics_added"
+    suggestions: list = field(default_factory=list)  # for "topic_suggestions": auto_topics.NewTopic
     # For type == "ask": text shown in the input dialog, and whether to mask.
     prompt: Optional[str] = None
     secret: bool = False
@@ -60,6 +61,7 @@ class DigestWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._check_now_event = threading.Event()
         self._reload_event = threading.Event()
+        self._suggest_event = threading.Event()
         self._answers: "queue.Queue[Optional[str]]" = queue.Queue()
         self._code_attempts = 0
 
@@ -68,6 +70,11 @@ class DigestWorker(threading.Thread):
         self._stop_event.set()
 
     def check_now(self) -> None:
+        self._check_now_event.set()
+
+    def suggest_topics(self) -> None:
+        """Scan now and offer the topics found by the embedded AI (nothing is saved)."""
+        self._suggest_event.set()
         self._check_now_event.set()
 
     def answer(self, value: Optional[str]) -> None:
@@ -203,6 +210,9 @@ class DigestWorker(threading.Thread):
                 due = (time.monotonic() - last_check) >= interval_seconds
                 if due or self._check_now_event.is_set():
                     self._check_now_event.clear()
+                    suggest = self._suggest_event.is_set()
+                    self._suggest_event.clear()
+                    collect = app_config.auto_topics or suggest
                     self._emit_status("Проверка новых постов...")
                     try:
                         # manual corrections become examples for the LLM
@@ -223,13 +233,17 @@ class DigestWorker(threading.Thread):
                             progress=lambda d, t: self._emit_status(
                                 f"Проверка каналов: {d}/{t}"
                             ),
-                            unplaced_out=unplaced if app_config.auto_topics else None,
-                            context_out=context if app_config.auto_topics else None,
+                            unplaced_out=unplaced if collect else None,
+                            context_out=context if collect else None,
                         )
                         last_check = time.monotonic()
                         if scored:
                             self.events.put(WorkerEvent(type="posts", posts=scored))
-                        if app_config.auto_topics:
+                        if suggest:
+                            await self._auto_create_topics(
+                                app_config, relevance_filter, unplaced, context, suggest_only=True
+                            )
+                        elif app_config.auto_topics:
                             await self._auto_create_topics(app_config, relevance_filter, unplaced, context)
                         self._emit_status("Ожидание")
                     except Exception as e:
@@ -267,10 +281,13 @@ class DigestWorker(threading.Thread):
         self._emit_status("Остановлено")
 
     async def _auto_create_topics(
-        self, app_config, relevance_filter, unplaced: list[str], context: Optional[dict] = None
+        self, app_config, relevance_filter, unplaced: list[str], context: Optional[dict] = None,
+        suggest_only: bool = False,
     ) -> None:
         """Group the posts no topic fit; every big enough group becomes a new topic."""
         if len(unplaced) < app_config.auto_topics_min_posts or not hasattr(relevance_filter, "embed_texts"):
+            if suggest_only:
+                self.events.put(WorkerEvent(type="topic_suggestions", suggestions=[]))
             return
         from auto_topics import discover_topics
 
@@ -294,6 +311,9 @@ class DigestWorker(threading.Thread):
             (context or {}).get("channels"),
             (context or {}).get("corpus"),
         )
+        if suggest_only:
+            self.events.put(WorkerEvent(type="topic_suggestions", suggestions=list(found or [])))
+            return
         if not found:
             return
         # re-read the file: the user may have edited topics in Settings meanwhile

@@ -514,6 +514,10 @@ class SettingsTab(ctk.CTkFrame):
         ctk.CTkButton(
             head, text="+ Добавить тему", width=140, command=lambda: self._add_topic_row()
         ).pack(side="right")
+        self.suggest_btn = ctk.CTkButton(
+            head, text="✨ Предложить темы (ИИ)", width=180, command=self._suggest_topics,
+        )
+        self.suggest_btn.pack(side="right", padx=(0, 8))
         ctk.CTkButton(
             head, text="Стандартные темы", width=140, fg_color=("#e8f0fe", "#243049"),
             hover_color=("#d6e4fd", "#2f3f60"), text_color=("#1a56c4", "#8ab4ff"),
@@ -641,6 +645,93 @@ class SettingsTab(ctk.CTkFrame):
         if keywords:
             kw_entry.insert(0, keywords)
         self._topic_rows.append(entry)
+
+    def _suggest_topics(self) -> None:
+        """Ask the worker to scan and find new topics among posts that fit none."""
+        self.suggest_btn.configure(state="disabled", text="Ищу темы…")
+        self.status_label.configure(
+            text="Сканирую каналы и ищу группы похожих постов, не подошедших ни под одну тему…",
+            text_color="gray",
+        )
+        self.app.worker.suggest_topics()
+
+    def show_suggestions(self, found: list) -> None:
+        """Dialog: found topics with editable name/tags; the chosen ones are saved."""
+        self.suggest_btn.configure(state="normal", text="✨ Предложить темы (ИИ)")
+        if not found:
+            self.status_label.configure(
+                text="Новых тем не нашлось: нет достаточно большой группы похожих неподошедших постов.",
+                text_color="gray",
+            )
+            return
+        self.status_label.configure(text="")
+        win = ctk.CTkToplevel(self)
+        win.title("Предложенные темы")
+        win.geometry("760x460")
+        win.transient(self.winfo_toplevel())
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            win, anchor="w", justify="left", text_color="gray",
+            text="Темы названы встроенным ИИ по группам похожих постов. Отметьте нужные, "
+            "поправьте название и теги (слова через запятую) и сохраните.",
+            wraplength=720,
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        body = ctk.CTkScrollableFrame(win)
+        body.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+        body.grid_columnconfigure(2, weight=1)
+        rows = []
+        for i, t in enumerate(found):
+            var = ctk.BooleanVar(value=True)
+            ctk.CTkCheckBox(body, text="", variable=var, width=24).grid(row=2 * i, column=0, padx=(2, 4), pady=(8, 0))
+            name_e = ctk.CTkEntry(body, width=190)
+            name_e.insert(0, t.merge_into or t.name)
+            if t.merge_into:
+                name_e.configure(state="disabled")
+            name_e.grid(row=2 * i, column=1, padx=4, pady=(8, 0))
+            kw_e = ctk.CTkEntry(body)
+            kw_e.insert(0, ", ".join(t.keywords))
+            kw_e.grid(row=2 * i, column=2, padx=(4, 2), pady=(8, 0), sticky="ew")
+            info = f"постов: {len(t.members)}" + (
+                f" · дополнит существующую тему «{t.merge_into}»" if t.merge_into else " · новая тема"
+            )
+            ctk.CTkLabel(body, text=info, text_color="gray", anchor="w").grid(
+                row=2 * i + 1, column=1, columnspan=2, sticky="w", padx=6
+            )
+            rows.append((var, name_e, kw_e, t))
+
+        def save() -> None:
+            have = {e["name"].get().strip().lower(): e for e in self._topic_rows}
+            n = 0
+            for var, name_e, kw_e, t in rows:
+                if not var.get():
+                    continue
+                name = name_e.get().strip()
+                kws = [k.strip() for k in kw_e.get().split(",") if k.strip()]
+                if not name:
+                    continue
+                entry = have.get(name.lower())
+                if entry:
+                    old = [k.strip() for k in entry["kw"].get().split(",") if k.strip()]
+                    low = {k.lower() for k in old}
+                    entry["kw"].delete(0, "end")
+                    entry["kw"].insert(0, ", ".join(old + [k for k in kws if k.lower() not in low]))
+                else:
+                    if len(self._topic_rows) == 1 and not self._topic_rows[0]["name"].get().strip():
+                        self._topic_rows[0]["name"].insert(0, name)
+                        self._topic_rows[0]["kw"].insert(0, ", ".join(kws))
+                    else:
+                        self._add_topic_row(name, ", ".join(kws))
+                n += 1
+            win.destroy()
+            if n:
+                self._on_save()
+
+        foot = ctk.CTkFrame(win, fg_color="transparent")
+        foot.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        ctk.CTkButton(foot, text="Сохранить выбранные", width=190, command=save).pack(side="right")
+        ctk.CTkButton(foot, text="Закрыть", width=100, fg_color="gray", command=win.destroy).pack(side="right", padx=8)
+        win.after(100, win.focus)
 
     def _add_default_topics(self) -> None:
         """Add the ready-made topics that are not in the list yet (by name)."""
@@ -1474,6 +1565,8 @@ class DigestApp(ctk.CTk):
             self.status_bar.configure(text=event.status, text_color=("black", "white"))
             if event.status == "Ожидание" or event.status.startswith("Найдено каналов"):
                 self.settings_tab.refresh_channels()  # channel list is now in storage
+        elif event.type == "topic_suggestions":
+            self.settings_tab.show_suggestions(event.suggestions)
         elif event.type == "topics_added":
             try:
                 self.config = load_app_config()
