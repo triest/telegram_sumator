@@ -38,7 +38,9 @@ _STOP = set(
     http https www com the and for you with that this have from потом точно происходит увидели хорошо хотел
     хочу просто почему какой какая какие каждый несколько много многие после поэтому теперь тогда однако
     вообще конечно именно можете могут должны нужны давай давайте смотри слово слова пост посты друзья
-    друг привет спасибо пожалуйста ставь подписаться подписывайтесь канал канале""".split()
+    друг привет спасибо пожалуйста ставь подписаться подписывайтесь канал канале
+    взять взяли берите брать купить покупать получить смотреть читать узнать продавца продавец продавцу
+    ценой цены цена цену рублей рубль руб ссылка ссылке ссылку тоже тому всего пока""".split()
 )
 _LINK = re.compile(r"\[[^\]]*\]\([^)]*\)|https?://\S+|t\.me/\S+|@\w+")
 # a word that opens or closes most posts of a group is a channel's template/signature
@@ -107,7 +109,9 @@ def dedupe(vectors: np.ndarray, sim: float = DUPLICATE_SIM) -> list[int]:
     return keep
 
 
-def extract_keywords(member_texts: Sequence[str], all_texts: Sequence[str], limit: int = 7) -> list[str]:
+def extract_keywords(
+    member_texts: Sequence[str], all_texts: Sequence[str], limit: int = 7, boost: Optional[set] = None
+) -> list[str]:
     """Words shared by several posts of the group but rare in the other unplaced posts."""
     in_group = Counter()
     for t in member_texts:
@@ -120,9 +124,20 @@ def extract_keywords(member_texts: Sequence[str], all_texts: Sequence[str], limi
     for w, df in in_group.items():
         if df < 2:
             continue
-        scored.append((df * math.log((n + 1) / (overall[w] - df + 1) + 1.0), w))
+        score = df * math.log((n + 1) / (overall[w] - df + 1) + 1.0)
+        scored.append((score * 2 if boost and w in boost else score, w))
     scored.sort(reverse=True)
-    return [w for _, w in scored[:limit]]
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, w in scored:
+        stem = w[:5]  # купон / купоном / купоны count once
+        if stem in seen:
+            continue
+        seen.add(stem)
+        out.append(w)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _fallback_name(keywords: list[str]) -> str:
@@ -137,12 +152,17 @@ def discover_topics(
     min_posts: int = 4,
     max_new: int = 2,
     existing_vectors: Optional[np.ndarray] = None,
+    channels: Optional[Sequence[str]] = None,
+    background: Optional[Sequence[str]] = None,
 ) -> list[NewTopic]:
     """Find up to `max_new` new topics among posts no existing topic matched.
 
     `embed` returns L2-normalised vectors. `existing_vectors` (same space) are the
     embeddings of the current topic names, used to avoid duplicating a topic.
     `namer(sample_texts, existing_names)` returns a short name or "".
+    `channels` (one title per text) says where each post came from: the group's channel
+    theme goes to the namer and its title words may be keywords. `background` = the
+    other posts of the same scan: words common there are the feed's normal vocabulary.
     """
     texts = [clean(t)[:1000] for t in texts]
     idx = [i for i, t in enumerate(texts) if len(t) >= 40]  # tiny posts carry no topic
@@ -168,7 +188,15 @@ def discover_topics(
         members = [idx[k] for k in g]
         sample = [texts[i] for i in members]
         tpl = template_words(sample)
-        keywords = [w for w in extract_keywords(sample, [texts[i] for i in idx], limit=10) if w not in tpl][:5]
+        chan_titles = [channels[i] for i in members if channels is not None and i < len(channels) and channels[i]]
+        main_chan = Counter(chan_titles).most_common(1)[0][0] if chan_titles else ""
+        chan_words = _words(main_chan.lower()) if main_chan else set()
+        corpus = [texts[i] for i in idx] + [clean(t)[:1000] for t in (background or [])]
+        # the channel's own name is a legit keyword even when every post opens with it
+        keywords = [
+            w for w in extract_keywords(sample, corpus, limit=10, boost=chan_words)
+            if w not in tpl or w in chan_words
+        ][:5]
         if existing_vectors is not None and len(existing_vectors):
             sims = existing_vectors @ centre
             best = int(sims.argmax())
@@ -184,7 +212,8 @@ def discover_topics(
         name = ""
         if namer is not None:
             try:
-                name = namer(sample[:6], list(existing_names))
+                hint = [f"(канал «{main_chan}») {sample[0]}"] + sample[1:6] if main_chan else sample[:6]
+                name = namer(hint, list(existing_names))
             except Exception as e:  # LLM missing/slow: keywords will do
                 logger.info("Название темы от ИИ не получено (%s), беру ключевые слова", e)
         name = (name or (_fallback_name(keywords) if keywords else "")).strip()

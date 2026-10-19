@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS feedback (
     ts        REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS image_feedback (
+    img_hash TEXT PRIMARY KEY,   -- md5 of the picture file
+    path     TEXT NOT NULL,      -- thumbnail on disk (re-embedded on load)
+    topic    TEXT NOT NULL,      -- topic name, or '' = "none of the topics"
+    ts       REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -164,6 +171,29 @@ class Storage:
             "SELECT text, topic FROM feedback ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return [(r["text"], r["topic"]) for r in rows]
+
+    def add_image_feedback(self, path: str, topic: str) -> bool:
+        """Remember a manual verdict for a picture (picture-only posts have no text to learn from)."""
+        import hashlib
+        import time
+
+        try:
+            with open(path, "rb") as f:
+                h = hashlib.md5(f.read()).hexdigest()
+        except OSError:
+            return False
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO image_feedback(img_hash, path, topic, ts) VALUES (?,?,?,?)",
+                (h, path, topic, time.time()),
+            )
+        return True
+
+    def list_image_feedback(self, limit: int = 200) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT path, topic FROM image_feedback ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [(r["path"], r["topic"]) for r in rows]
 
     # -- channel home category: which topic a channel belongs to ------
     def get_channel_category(self, channel_id: int):

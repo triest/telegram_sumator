@@ -72,6 +72,14 @@ def notify_posts(scored_posts: list[ScoredPost]) -> None:
         notify("Telegram Digest", f"...и ещё {remaining} пост(ов), см. вывод программы")
 
 
+def apply_feedback(relevance_filter, storage: Storage) -> None:
+    """Load the user's manual topic corrections into the filter (same as the GUI worker)."""
+    if hasattr(relevance_filter, "set_feedback"):
+        fb = storage.list_feedback()
+        if fb:
+            relevance_filter.set_feedback(fb)
+
+
 async def run_once(limit_per_channel: int) -> list[ScoredPost]:
     creds = load_credentials()
     app_config = load_app_config()
@@ -90,11 +98,13 @@ async def run_once(limit_per_channel: int) -> list[ScoredPost]:
         app_config.all_examples(),
         threshold=app_config.similarity_threshold,
         device=app_config.embedding_device,
-                model_name=app_config.embedding_model,
+        model_name=app_config.embedding_model,
         topics=app_config.topics,
         llm_model=app_config.llm_model if app_config.llm_classify else "",
         llm_url=app_config.llm_url,
     )
+
+    apply_feedback(relevance_filter, storage)
 
     async with TelegramDigestClient(creds) as client:
         scored_posts = await check_once(
@@ -133,7 +143,7 @@ async def run_loop(limit_per_channel: int) -> None:
         app_config.all_examples(),
         threshold=app_config.similarity_threshold,
         device=app_config.embedding_device,
-                model_name=app_config.embedding_model,
+        model_name=app_config.embedding_model,
         topics=app_config.topics,
         llm_model=app_config.llm_model if app_config.llm_classify else "",
         llm_url=app_config.llm_url,
@@ -146,6 +156,7 @@ async def run_loop(limit_per_channel: int) -> None:
         )
         while True:
             try:
+                apply_feedback(relevance_filter, storage)
                 scored_posts = await check_once(
                     client=client,
                     storage=storage,
@@ -196,7 +207,7 @@ def main() -> None:
     try:
         if args.once:
             scored_posts = asyncio.run(run_once(limit_per_channel=args.limit))
-            print_digest(scored_posts, app_config)
+            print_digest(scored_posts, load_app_config())
             notify_posts(scored_posts)
         else:
             asyncio.run(run_loop(limit_per_channel=args.limit))

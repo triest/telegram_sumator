@@ -90,6 +90,30 @@ class ImageTopicClassifier:
             logger.warning("Распознавание картинок недоступно (модель не загрузилась)", exc_info=True)
             return False
 
+    def encode(self, paths: Sequence[str]) -> list[Optional[np.ndarray]]:
+        """Normalised CLIP vector per picture (None if it can't be read). Never raises."""
+        out: list[Optional[np.ndarray]] = [None] * len(paths)
+        if not paths or not self._ensure():
+            return out
+        from PIL import Image
+
+        ok_idx, images = [], []
+        for i, p in enumerate(paths):
+            try:
+                with Image.open(p) as im:
+                    images.append(im.convert("RGB").copy())
+                ok_idx.append(i)
+            except Exception:
+                continue
+        if images:
+            try:
+                vecs = self._img.encode(images, normalize_embeddings=True, convert_to_numpy=True, batch_size=16)
+                for i, v in zip(ok_idx, vecs):
+                    out[i] = v
+            except Exception:
+                logger.warning("Картинки не закодированы", exc_info=True)
+        return out
+
     def classify(self, paths: Sequence[str]) -> list[tuple[Optional[int], float]]:
         """For each picture: (index of the topic or None, probability). Never raises."""
         out: list[tuple[Optional[int], float]] = [(None, 0.0)] * len(paths)

@@ -265,6 +265,48 @@ class EmbeddingFilter:
         emb = self._encode_posts([t if t.strip() else " " for t in texts])
         return _cosine_similarity_matrix(emb, self._example_embeddings)
 
+    # A picture this close (CLIP cosine) to one the user already judged gets the same verdict.
+    IMAGE_FEEDBACK_SIM = 0.92
+
+    def set_image_feedback(self, feedback) -> None:
+        """Manual verdicts for pictures: [(thumbnail path, topic or "" = not interesting)]."""
+        feedback = list(feedback or [])
+        if feedback == getattr(self, "_img_fb_src", None):
+            return
+        self._img_fb_src = feedback
+        self._img_fb_vecs, self._img_fb_topics = None, []
+        if not feedback:
+            return
+        if getattr(self, "_image_clf", None) is None:
+            from image_topics import ImageTopicClassifier
+
+            self._image_clf = ImageTopicClassifier(self.interest_examples, self.device)
+        vecs = self._image_clf.encode([p for p, _ in feedback])
+        keep = [(v, t) for v, (_, t) in zip(vecs, feedback) if v is not None]
+        if keep:
+            self._img_fb_vecs = np.stack([v for v, _ in keep])
+            self._img_fb_topics = [t for _, t in keep]
+
+    def _apply_image_feedback(self, texts: list[str], images, results: list[FilterResult]) -> None:
+        if getattr(self, "_img_fb_vecs", None) is None:
+            return
+        todo = [i for i, im in enumerate(images) if im and len(texts[i].strip()) < 60]
+        if not todo:
+            return
+        for i, v in zip(todo, self._image_clf.encode([images[i] for i in todo])):
+            if v is None:
+                continue
+            sims = self._img_fb_vecs @ v
+            j = int(np.argmax(sims))
+            if sims[j] < self.IMAGE_FEEDBACK_SIM:
+                continue
+            topic = self._img_fb_topics[j]
+            example = next((e for e in self.interest_examples if self._doc_text(e) == topic), None) if topic else None
+            if topic and example:
+                results[i] = FilterResult(True, 0.95, example, "вручную")
+            elif not topic:
+                results[i] = FilterResult(False, 0.0, results[i].matched_example, "вручную")
+
     def _apply_images(self, texts: list[str], images, results: list[FilterResult]) -> None:
         """Picture-only / short-caption posts: the local picture model picks the topic."""
         todo = [
@@ -301,6 +343,7 @@ class EmbeddingFilter:
         use_images = bool(images) and getattr(self, "image_recognition", True)
         if not non_empty_idx:
             if use_images:  # picture-only posts: nothing to read, the picture decides
+                self._apply_image_feedback(texts, images, results)  # type: ignore[arg-type]
                 self._apply_images(texts, images, results)  # type: ignore[arg-type]
             return results  # type: ignore[return-value]
 
@@ -323,6 +366,7 @@ class EmbeddingFilter:
             )
             results[i].source = "смысл"
         if use_images:
+            self._apply_image_feedback(texts, images, results)  # type: ignore[arg-type]
             self._apply_images(texts, images, results)  # type: ignore[arg-type]
         self._apply_feedback(texts, results)  # type: ignore[arg-type]
         return results  # type: ignore[return-value]
@@ -430,6 +474,10 @@ class TopicKeywordBoost:
     def set_feedback(self, feedback) -> None:
         if hasattr(self.base, "set_feedback"):
             self.base.set_feedback(feedback)
+
+    def set_image_feedback(self, feedback) -> None:
+        if hasattr(self.base, "set_image_feedback"):
+            self.base.set_image_feedback(feedback)
 
     def describe(self) -> str:
         return getattr(self.base, "describe", lambda: "?")() + " + слова тем"

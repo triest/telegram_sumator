@@ -64,6 +64,7 @@ async def check_once(
     limit_per_channel: int = 200,
     progress: Optional[Callable[[int, int], None]] = None,
     unplaced_out: Optional[list[str]] = None,
+    context_out: Optional[dict] = None,
 ) -> list[ScoredPost]:
     """Run one fetch+filter pass over all watched channels.
 
@@ -283,10 +284,18 @@ async def check_once(
                     fresh = []
                     if unplaced_out is not None:
                         # posts no topic fit (before the "every post gets a category" fallback)
-                        unplaced_out.extend(
-                            p.text for p, r in zip(candidates, results)
+                        miss = [
+                            p for p, r in zip(candidates, results)
                             if not r.is_relevant and r.source != "вручную" and p.text.strip()
-                        )
+                        ]
+                        unplaced_out.extend(p.text for p in miss)
+                        if context_out is not None:
+                            # channel of every unplaced post + all other posts as background
+                            # (their words are the feed's "normal" vocabulary, not a topic)
+                            context_out.setdefault("channels", []).extend(ch.title or "" for _ in miss)
+                            context_out.setdefault("corpus", []).extend(
+                                p.text for p in candidates if p.text.strip()
+                            )
                     if force:
                         # Every channel fits one of the topics: whatever no engine could
                         # place goes to the channel's own topic (or the closest one).

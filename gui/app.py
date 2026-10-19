@@ -811,6 +811,103 @@ class SettingsTab(ctk.CTkFrame):
         )
 
 
+class ChannelSummaryWindow(ctk.CTkToplevel):
+    """Short per-channel digest, grouped by topic: post count, best headline, optional local-LLM resume."""
+
+    def __init__(self, app: "DigestApp", cards: list) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("TelegrammSumator — резюме по каналам")
+        self.geometry("760x640")
+        self._cards = cards
+        self._busy: set[str] = set()
+        self._results: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._texts: dict[str, str] = {}
+        self.body = ctk.CTkScrollableFrame(self)
+        self.body.pack(fill="both", expand=True, padx=8, pady=8)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._render()
+        self.after(300, self._poll)
+        self.after(150, self.focus_force)
+
+    def _render(self) -> None:
+        for w in self.body.winfo_children():
+            w.destroy()
+        groups: dict[str, dict[str, list]] = {}
+        for c in self._cards:
+            chan = c.scored.post.channel_title or c.scored.post.channel_username or "Канал"
+            groups.setdefault(c.topic, {}).setdefault(chan, []).append(c)
+        if not groups:
+            ctk.CTkLabel(self.body, text="В ленте пока нет постов.").pack(pady=20)
+            return
+        for topic, chans in sorted(groups.items(), key=lambda kv: -sum(len(v) for v in kv[1].values())):
+            total = sum(len(v) for v in chans.values())
+            head = ctk.CTkFrame(self.body, fg_color=topic_color(topic), corner_radius=12)
+            head.pack(fill="x", padx=4, pady=(10, 2))
+            ctk.CTkLabel(
+                head, text=f"{_short(topic, 50)}  ({total} в {len(chans)} кан.)",
+                text_color=TEXT_ON_CHIP, font=ctk.CTkFont(size=15, weight="bold"), anchor="w",
+            ).pack(side="left", padx=10, pady=6)
+            if self.app.config.llm_model:
+                busy = topic in self._busy
+                ctk.CTkButton(
+                    head, text="Резюме…" if busy else "Резюме (ИИ)", width=110,
+                    state="disabled" if busy else "normal",
+                    command=lambda t=topic, ch=chans: self._summarize(t, ch),
+                ).pack(side="right", padx=6, pady=4)
+            if topic in self._texts:
+                ctk.CTkLabel(
+                    self.body, text=self._texts[topic], justify="left", anchor="w", wraplength=700,
+                    fg_color=("#f4f6fa", "#1a2030"), corner_radius=10,
+                ).pack(fill="x", padx=4, pady=(0, 4), ipadx=8, ipady=6)
+            for chan, cards in sorted(chans.items(), key=lambda kv: -len(kv[1])):
+                best = max(cards, key=lambda c: c.scored.result.score)
+                headline = _short(" ".join(best.scored.post.text.split()), 140)
+                ctk.CTkLabel(
+                    self.body, text=f"• {_short(chan, 40)} — {len(cards)}: {headline}",
+                    justify="left", anchor="w", wraplength=700,
+                ).pack(fill="x", padx=14, pady=1)
+
+    def _summarize(self, topic: str, chans: dict) -> None:
+        import threading
+
+        from llm import summarize_topic
+
+        self._busy.add(topic)
+        self._render()
+        texts = [
+            f"{chan}: {' '.join(c.scored.post.text.split())[:300]}"
+            for chan, cards in chans.items()
+            for c in sorted(cards, key=lambda c: -c.scored.result.score)[:2]
+        ]
+        model, url = self.app.config.llm_model, self.app.config.llm_url
+
+        def job() -> None:
+            try:
+                self._results.put((topic, summarize_topic(topic, texts, model, url) or "(пустой ответ)"))
+            except Exception as e:
+                logger.error("Резюме по каналам не удалось: %s", e)
+                self._results.put((topic, f"Не удалось получить резюме: {e}"))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _poll(self) -> None:
+        if not self.winfo_exists():
+            return
+        changed = False
+        while True:
+            try:
+                topic, text = self._results.get_nowait()
+            except Exception:
+                break
+            self._busy.discard(topic)
+            self._texts[topic] = text
+            changed = True
+        if changed:
+            self._render()
+        self.after(300, self._poll)
+
+
 class AskDialog(ctk.CTkToplevel):
     """Modal input dialog (login code / phone / 2FA password).
 
@@ -1030,6 +1127,10 @@ class DigestApp(ctk.CTk):
 
         self.feed_count_label = ctk.CTkLabel(toolbar, text="Постов: 0", text_color="gray")
         self.feed_count_label.pack(side="left", padx=12)
+        ctk.CTkButton(
+            toolbar, text="Резюме по каналам", width=150,
+            command=lambda: ChannelSummaryWindow(self, list(self._feed_cards)),
+        ).pack(side="right", padx=4)
 
         self.feed_frame = ctk.CTkScrollableFrame(self.feed_tab)
         self.feed_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
@@ -1150,6 +1251,10 @@ class DigestApp(ctk.CTk):
         try:
             if self.storage and post.text.strip():
                 self.storage.add_feedback(post.text, saved)
+            # picture-only / short-caption posts: remember the picture itself
+            img = getattr(post, "image_path", None)
+            if self.storage and img and len(post.text.strip()) < 60 and os.path.exists(img):
+                self.storage.add_image_feedback(img, saved)
         except Exception:
             logger.debug("не удалось сохранить правку", exc_info=True)
         self._refresh_topic_menu()

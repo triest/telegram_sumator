@@ -210,7 +210,10 @@ class DigestWorker(threading.Thread):
                             fb = storage.list_feedback()
                             if fb != getattr(relevance_filter, "feedback", None):
                                 relevance_filter.set_feedback(fb)
+                        if hasattr(relevance_filter, "set_image_feedback"):
+                            relevance_filter.set_image_feedback(storage.list_image_feedback())
                         unplaced: list[str] = []
+                        context: dict = {}
                         scored = await check_once(
                             client=client,
                             storage=storage,
@@ -221,12 +224,13 @@ class DigestWorker(threading.Thread):
                                 f"Проверка каналов: {d}/{t}"
                             ),
                             unplaced_out=unplaced if app_config.auto_topics else None,
+                            context_out=context if app_config.auto_topics else None,
                         )
                         last_check = time.monotonic()
                         if scored:
                             self.events.put(WorkerEvent(type="posts", posts=scored))
                         if app_config.auto_topics:
-                            await self._auto_create_topics(app_config, relevance_filter, unplaced)
+                            await self._auto_create_topics(app_config, relevance_filter, unplaced, context)
                         self._emit_status("Ожидание")
                     except Exception as e:
                         logger.exception("Check failed")
@@ -262,7 +266,9 @@ class DigestWorker(threading.Thread):
         storage.close()
         self._emit_status("Остановлено")
 
-    async def _auto_create_topics(self, app_config, relevance_filter, unplaced: list[str]) -> None:
+    async def _auto_create_topics(
+        self, app_config, relevance_filter, unplaced: list[str], context: Optional[dict] = None
+    ) -> None:
         """Group the posts no topic fit; every big enough group becomes a new topic."""
         if len(unplaced) < app_config.auto_topics_min_posts or not hasattr(relevance_filter, "embed_texts"):
             return
@@ -285,6 +291,8 @@ class DigestWorker(threading.Thread):
             app_config.auto_topics_min_posts,
             2,
             relevance_filter.topic_name_vectors(),
+            (context or {}).get("channels"),
+            (context or {}).get("corpus"),
         )
         if not found:
             return

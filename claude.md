@@ -76,6 +76,7 @@ Details (architecture, measured results, how to benchmark, pitfalls) are in the 
 - Prefer the measurably better option and implement it; report numbers honestly (what got better, what did not).
 - The GPU is shared with ComfyUI generations: heavy runs can be slow; wait instead of killing other processes.
 - Commit and push only when asked. Secrets stay in `.env`; `config.yaml`, `session/`, `data/`, `models/` are git-ignored.
+- **Rule: the terminal window/tab title is always the project name, `TelegrammSumator`** (not "Telegram Digest", not an auto-generated topic). Claude can't change the parent terminal's title from a tool call; the owner sets it once with `/rename TelegrammSumator` (`terminalTitleFromRename` keeps it). If a session's tab shows anything else, say so at the start instead of silently ignoring it.
 - Run from source with `run_source.bat` (`TelegramDigest.exe` / `run_gui.bat` use the old `dist` build until rebuilt).
 
 ## Skills in this repo
