@@ -860,13 +860,23 @@ class ChannelSummaryWindow(ctk.CTkToplevel):
                     self.body, text=self._texts[topic], justify="left", anchor="w", wraplength=700,
                     fg_color=("#f4f6fa", "#1a2030"), corner_radius=10,
                 ).pack(fill="x", padx=4, pady=(0, 4), ipadx=8, ipady=6)
+            dark = ctk.get_appearance_mode() == "Dark"
+            link_color = "#6cb6ff" if dark else "#1a56c4"
             for chan, cards in sorted(chans.items(), key=lambda kv: -len(kv[1])):
-                best = max(cards, key=lambda c: c.scored.result.score)
-                headline = _short(" ".join(best.scored.post.text.split()), 140)
                 ctk.CTkLabel(
-                    self.body, text=f"• {_short(chan, 40)} — {len(cards)}: {headline}",
-                    justify="left", anchor="w", wraplength=700,
-                ).pack(fill="x", padx=14, pady=1)
+                    self.body, text=f"• {_short(chan, 40)} — {len(cards)}",
+                    justify="left", anchor="w", font=ctk.CTkFont(weight="bold"),
+                ).pack(fill="x", padx=14, pady=(4, 0))
+                for c in sorted(cards, key=lambda c: -c.scored.result.score)[:3]:
+                    post = c.scored.post
+                    line = _short(" ".join(post.text.split()) or "(без текста)", 130)
+                    lab = ctk.CTkLabel(
+                        self.body, text=f"↗ {line}", justify="left", anchor="w", wraplength=680,
+                        text_color=link_color, cursor="hand2" if post.link else "",
+                    )
+                    lab.pack(fill="x", padx=30, pady=0)
+                    if post.link:
+                        lab.bind("<Button-1>", lambda _e, u=post.link: webbrowser.open(u))
 
     def _summarize(self, topic: str, chans: dict) -> None:
         import threading
@@ -1289,14 +1299,11 @@ class DigestApp(ctk.CTk):
             sp = c.scored
             if sp.post.channel_id != post.channel_id or sp.result.source == "вручную":
                 continue
-            if sp.result.source in ("ИИ", "ИИ-фото") and c.topic == topic:
-                continue
             if c.topic == topic:
                 continue
-            # strong engine verdicts (keywords/LLM) for another topic are kept
-            if sp.result.is_relevant and sp.result.source in ("ИИ", "ИИ-фото", "слова"):
-                continue
-            sp.result = FilterResult(True, max(sp.result.score, 0.5), example, "канал")
+            # the owner moved the whole channel: its posts move too, whatever engine placed
+            # them ("вручную" pins them, so a rescan does not undo it). No reload.
+            sp.result = FilterResult(True, max(sp.result.score, 0.5), example, "вручную")
             c.topic = topic_label(sp)
             c._built = False
             moved += 1

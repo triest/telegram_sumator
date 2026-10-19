@@ -88,7 +88,7 @@ Skills load on demand (only their name/description sit in context; the body open
 ## Open work
 - Port Qwen3-Embedding / feedback / baseline fixes to `termux_main.py` (only `embedding_model` is wired for Termux). Android `core.py` already has auto topics (untuned thresholds, Kotlin not compiled).
 - Build the Android APK (no JDK/SDK found on this machine; old `TelegramDigest.apk` predates auto topics).
-- Rebuild the PyInstaller exe (the old `dist` build lacks all recent changes).
+- The exe is built by `build_exe.bat` (run it from PowerShell as `.\build_exe.bat`, `--clean` wipes build/dist first; stop the running exe first). Rebuild after code changes — `dist` is only as new as the last build.
 - Validate in the running GUI: 👍/👎 buttons, auto-topics checkbox, CLIP model download on first picture.
 - Auto topics: merge into similar topics is implemented but not yet seen on live data; keywords still sometimes generic (capped at 5).
 - Re-tune `similarity_threshold` (0.62) after the user's own 👍/👎 data accumulates in the `feedback` table.
