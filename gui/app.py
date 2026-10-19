@@ -380,7 +380,7 @@ class PostCard(ctk.CTkFrame):
                 text_color=("#374151", "#c9d3e6"),
                 command=lambda choice: self._on_move(self, choice),
             )
-            menu.set("Перенести в тему…")
+            menu.set("Этот пост → тема…")
             menu.grid(row=0, column=12, padx=(6, 0), sticky="e")
         if self._on_channel and self._topic_names:
             cmenu = ctk.CTkOptionMenu(
@@ -390,7 +390,7 @@ class PostCard(ctk.CTkFrame):
                 text_color=("#374151", "#c9d3e6"),
                 command=lambda choice: self._on_channel(self, choice),
             )
-            cmenu.set("Канал → тема…")
+            cmenu.set("Весь канал → тема…")
             cmenu.grid(row=0, column=13, padx=(6, 0), sticky="e")
         ctk.CTkButton(
             foot, text="Открыть в Telegram ↗", width=150, height=24, corner_radius=8,
