@@ -209,6 +209,156 @@ def _llm_pick(helper, topics, channel, text, feedback=None):
     return None
 
 
+# ---------------------------------------------------------------- auto topics
+# Port of the desktop auto_topics.py (numpy only). The constants were tuned on desktop with
+# Qwen3-Embedding; this app uses MiniLM whose similarities run lower, so they are looser here
+# and NOT yet tuned on real posts -- check on-device before trusting new topics blindly.
+_CLUSTER_SIM = 0.50
+_EXISTING_SIM = 0.55
+_MIN_COHESION = 0.58
+_DUP_SIM = 0.95
+_TEMPLATE_SHARE = 0.7
+_EDGE = 40
+_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)|https?://\S+|t\.me/\S+|@\w+")
+_WORD = re.compile(r"[а-яёa-z][а-яёa-z]{4,}")
+_STOP = set(
+    """это как что так для при про или его она они оно все всё еще уже только очень можно нужно будет
+    если когда чтобы потому также этот этой этом эти этих тоже которые который которая которое есть были
+    было была быть себя свой своих мне меня тебя вас нас нам вам них ним там тут здесь даже чем
+    более менее после перед между через без под над сейчас сегодня вчера завтра года году лет раз
+    http https www com the and for you with that this have from потом точно происходит увидели хорошо хотел
+    хочу просто почему какой какая какие каждый несколько много многие поэтому теперь тогда однако
+    вообще конечно именно можете могут должны нужны давай давайте смотри слово слова пост посты друзья
+    друг привет спасибо пожалуйста ставь подписаться подписывайтесь канал канале""".split()
+)
+_suggestions = []
+
+
+def _clean(text):
+    text = _LINK.sub(" ", text).replace("*", " ").replace("_", " ")
+    return " ".join(text.split())
+
+
+def _words(text):
+    text = re.sub(r"https?://\S+|@\w+", " ", text.lower())
+    return {w for w in _WORD.findall(text) if w not in _STOP}
+
+
+def _dedupe(vecs):
+    keep = []
+    for i, v in enumerate(vecs):
+        if keep and float((vecs[keep] @ v).max()) >= _DUP_SIM:
+            continue
+        keep.append(i)
+    return keep
+
+
+def _cluster(vecs, sim=_CLUSTER_SIM):
+    cents, groups = [], []
+    for i, v in enumerate(vecs):
+        best, best_s = -1, sim
+        for k, c in enumerate(cents):
+            sc = float(v @ (c / (np.linalg.norm(c) + 1e-12)))
+            if sc >= best_s:
+                best, best_s = k, sc
+        if best < 0:
+            cents.append(v.copy())
+            groups.append([i])
+        else:
+            cents[best] += v
+            groups[best].append(i)
+    return groups
+
+
+def _template_words(texts):
+    edge = {}
+    for t in texts:
+        t = t.lower()
+        for w in _words(t[:_EDGE]) | _words(t[-_EDGE:]):
+            edge[w] = edge.get(w, 0) + 1
+    need = max(2, _TEMPLATE_SHARE * len(texts))
+    return {w for w, c in edge.items() if c >= need}
+
+
+def _keywords(members, all_texts, limit=10):
+    import math
+    from collections import Counter
+    ing, overall = Counter(), Counter()
+    for t in members:
+        ing.update(_words(t))
+    for t in all_texts:
+        overall.update(_words(t))
+    n = len(all_texts)
+    sc = [(df * math.log((n + 1) / (overall[w] - df + 1) + 1.0), w) for w, df in ing.items() if df >= 2]
+    sc.sort(reverse=True)
+    return [w for _, w in sc[:limit]]
+
+
+def _name_topic(helper, sample, existing):
+    if helper is None or not helper.hasLlm():
+        return ""
+    prompt = (
+        "Придумай короткое название темы (1-3 слова) для этих постов Telegram.\n"
+        "Уже есть темы: " + ", ".join(existing) + "\n\n"
+        + "\n".join(f"- {' '.join(t.split())[:200]}" for t in sample)
+        + "\n\nОтветь только названием."
+    )
+    ans = (helper.classify(prompt) or "").strip().strip("«»\"'.").split("\n")[0].strip()
+    return ans[:40] if 2 <= len(ans) <= 40 else ""
+
+
+def _discover(texts, vecs, topics, tvec, min_posts, helper, max_new=2):
+    """Groups of posts no topic fit -> [{name, keywords, count, merge_into}]."""
+    texts = [_clean(t)[:1000] for t in texts]
+    idx = [i for i, t in enumerate(texts) if len(t) >= 40]
+    if len(idx) < min_posts:
+        return []
+    v = vecs[idx]
+    keep = _dedupe(v)
+    idx = [idx[k] for k in keep]
+    v = v[keep]
+    if len(idx) < min_posts:
+        return []
+    names = [t["name"] for t in topics]
+    taken = {n.lower() for n in names}
+    tv = tvec / (np.linalg.norm(tvec, axis=1, keepdims=True) + 1e-12)
+    out = []
+    groups = sorted((g for g in _cluster(v) if len(g) >= min_posts), key=len, reverse=True)
+    for g in groups:
+        if sum(1 for o in out if not o["merge_into"]) >= max_new:
+            break
+        centre = v[g].mean(axis=0)
+        centre /= np.linalg.norm(centre) + 1e-12
+        if float((v[g] @ centre).mean()) < _MIN_COHESION:
+            continue
+        sample = [texts[idx[k]] for k in g]
+        tpl = _template_words(sample)
+        kws = [w for w in _keywords(sample, [texts[i] for i in idx]) if w not in tpl][:5]
+        sims = tv @ centre
+        best = int(sims.argmax())
+        if float(sims[best]) >= _EXISTING_SIM:
+            if kws:
+                out.append({"name": names[best], "keywords": kws[:4], "count": len(g), "merge_into": names[best]})
+            continue
+        if len(kws) < 2:
+            continue  # only a template left: an ad series, not a topic
+        try:
+            name = _name_topic(helper, sample[:6], names)
+        except Exception:
+            name = ""
+        name = (name or " / ".join(w.capitalize() for w in kws[:2])).strip()
+        if not name or name.lower() in taken:
+            continue
+        taken.add(name.lower())
+        out.append({"name": name, "keywords": kws, "count": len(g), "merge_into": ""})
+    return out
+
+
+def suggestions():
+    """JSON of what the last scan's auto-topic pass found (new topics / words for existing ones)."""
+    return json.dumps(_suggestions, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------- scan
 
 async def _scan(settings, helper):
@@ -268,6 +418,7 @@ async def _scan(settings, helper):
             result.append(p)
     else:
         sims = None
+        pvec = None
         fb = [f for f in settings.get("feedback", []) if f.get("text")][:120]
         fb_topic_idx = {t["name"]: k for k, t in enumerate(topics)}
         if use_emb:
@@ -364,6 +515,18 @@ async def _scan(settings, helper):
     if topics:
         accepted = {id(p) for p in result}
         others = sorted((p for p in posts if id(p) not in accepted), key=lambda p: -p["date"])[:100]
+        _suggestions.clear()
+        if settings.get("auto_topics", True) and pvec is not None and sims is not None and len(posts):
+            try:
+                pos = {id(p): i for i, p in enumerate(posts)}
+                rows = [pos[id(p)] for p in posts if id(p) not in accepted]
+                if rows:
+                    helper.progress("Ищу новые темы среди неподошедших…")
+                    _suggestions.extend(_discover(
+                        [posts[i]["text"] for i in rows], pvec[rows], topics, tvec,
+                        int(settings.get("auto_topics_min_posts", 4)), helper))
+            except Exception as e:
+                helper.progress(f"Автотемы не удались: {e}")
         for p in others:
             p.update(topic="Прочее (не подошло)", engine="")
             p["has_photo"] = p["has_video"] = False

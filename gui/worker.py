@@ -290,9 +290,20 @@ class DigestWorker(threading.Thread):
             return
         # re-read the file: the user may have edited topics in Settings meanwhile
         fresh = load_app_config()
-        known = {t.name.lower() for t in fresh.topics}
-        added = [t for t in found if t.name.lower() not in known]
-        if not added:
+        by_name = {t.name.lower(): t for t in fresh.topics}
+        merged = []
+        for t in found:
+            if not t.merge_into:
+                continue
+            topic = by_name.get(t.merge_into.lower())
+            have = {k.lower() for k in topic.keywords} if topic else set()
+            new_kw = [k for k in t.keywords if k.lower() not in have]
+            if topic and new_kw:
+                topic.keywords.extend(new_kw)
+                merged.append(t.merge_into)
+                logger.info("Тема «%s» дополнена словами: %s", t.merge_into, ", ".join(new_kw))
+        added = [t for t in found if not t.merge_into and t.name.lower() not in by_name]
+        if not added and not merged:
             return
         for t in added:
             fresh.topics.append(TopicConfig(name=t.name, keywords=t.keywords))
@@ -300,7 +311,8 @@ class DigestWorker(threading.Thread):
                 "Новая тема «%s» (постов: %d), слова: %s", t.name, len(t.members), ", ".join(t.keywords)
             )
         save_app_config(fresh)
-        self.events.put(WorkerEvent(type="topics_added", new_topics=[t.name for t in added]))
+        if added:
+            self.events.put(WorkerEvent(type="topics_added", new_topics=[t.name for t in added]))
         self._reload_event.set()  # rebuild the filter with the new topics and rescan
 
     def _emit_status(self, status: str) -> None:

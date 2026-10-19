@@ -448,6 +448,7 @@ class MainActivity : AppCompatActivity() {
                 if (!helper.hasEmbed()) log("Модель эмбеддингов не загружена — работаю только по ключевым словам (Настройки → Модели)")
                 val res = core.callAttr("scan", cfgJson, helper).toString()
                 store.feedJson = res
+                applyTopicSuggestions(core.callAttr("suggestions").toString())
                 val f = store.feed()
                 ui.post { feed = f; renderFeed() }
             } catch (t: Throwable) {
@@ -455,6 +456,35 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 ui.post { scanning = false; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
             }
+        }
+    }
+
+    /** Auto-topics found by the scan: new topics are added, similar existing ones get the group's words. */
+    private fun applyTopicSuggestions(json: String) {
+        try {
+            val a = org.json.JSONArray(json)
+            val list = store.topics
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                val kws = (0 until o.getJSONArray("keywords").length()).map { o.getJSONArray("keywords").getString(it) }
+                val into = o.optString("merge_into")
+                if (into.isNotEmpty()) {
+                    val t = list.firstOrNull { it.name.trim().equals(into, true) } ?: continue
+                    val have = t.keywords.split(",").map { it.trim().lowercase() }.toSet()
+                    val extra = kws.filter { it.lowercase() !in have }
+                    if (extra.isEmpty()) continue
+                    t.keywords = (t.keywords.trim().trimEnd(',') + ", " + extra.joinToString(", ")).trim(' ', ',')
+                    log("Тема «${t.name}» дополнена словами: ${extra.joinToString(", ")}")
+                } else {
+                    val name = o.getString("name")
+                    if (list.any { it.name.trim().equals(name, true) }) continue
+                    list.add(Topic(name, kws.joinToString(", ")))
+                    log("Новая тема «$name» (постов: ${o.getInt("count")}): ${kws.joinToString(", ")}")
+                }
+            }
+            if (a.length() > 0) store.topics = list
+        } catch (t: Throwable) {
+            log("Автотемы: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 

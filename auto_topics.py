@@ -26,6 +26,9 @@ CLUSTER_SIM = 0.58
 EXISTING_TOPIC_SIM = 0.62
 # Mean similarity of a group's posts to its centre; mixed bags fall below this.
 MIN_COHESION = 0.66
+# Posts this similar are the same text reposted (ads/spam across channels): they count
+# once, so a single template can't pass for a topic.
+DUPLICATE_SIM = 0.95
 
 _STOP = set(
     """это как что так для при про или его она они оно все всё еще уже только очень можно нужно будет
@@ -37,6 +40,10 @@ _STOP = set(
     вообще конечно именно можете могут должны нужны давай давайте смотри слово слова пост посты друзья
     друг привет спасибо пожалуйста ставь подписаться подписывайтесь канал канале""".split()
 )
+_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)|https?://\S+|t\.me/\S+|@\w+")
+# a word that opens or closes most posts of a group is a channel's template/signature
+TEMPLATE_SHARE = 0.7
+TEMPLATE_EDGE = 40
 _WORD = re.compile(r"[а-яёa-z][а-яёa-z]{4,}")
 
 
@@ -45,6 +52,25 @@ class NewTopic:
     name: str
     keywords: list[str]
     members: list[int] = field(default_factory=list)  # indices into the input texts
+    merge_into: str = ""  # existing topic this group belongs to: add keywords, don't create
+
+
+def clean(text: str) -> str:
+    """Drop links (with their labels), @mentions and markdown marks: channel signatures, not content."""
+    text = _LINK.sub(" ", text).replace("*", " ").replace("_", " ")
+    return " ".join(text.split())
+
+
+def template_words(member_texts: Sequence[str]) -> set[str]:
+    """Words found at the start or end of most posts of a group (templates, signatures)."""
+    if not member_texts:
+        return set()
+    edge = Counter()
+    for t in member_texts:
+        t = t.lower()
+        edge.update(_words(t[:TEMPLATE_EDGE]) | _words(t[-TEMPLATE_EDGE:]))
+    need = max(2, TEMPLATE_SHARE * len(member_texts))
+    return {w for w, c in edge.items() if c >= need}
 
 
 def _words(text: str) -> set[str]:
@@ -69,6 +95,16 @@ def cluster(vectors: np.ndarray, sim: float = CLUSTER_SIM) -> list[list[int]]:
             centroids[best] += v
             groups[best].append(i)
     return groups
+
+
+def dedupe(vectors: np.ndarray, sim: float = DUPLICATE_SIM) -> list[int]:
+    """Indices of the first post of every near-duplicate set (vectors are L2-normalised)."""
+    keep: list[int] = []
+    for i, v in enumerate(vectors):
+        if keep and float((vectors[keep] @ v).max()) >= sim:
+            continue
+        keep.append(i)
+    return keep
 
 
 def extract_keywords(member_texts: Sequence[str], all_texts: Sequence[str], limit: int = 7) -> list[str]:
@@ -108,28 +144,43 @@ def discover_topics(
     embeddings of the current topic names, used to avoid duplicating a topic.
     `namer(sample_texts, existing_names)` returns a short name or "".
     """
-    texts = [" ".join(t.split())[:1000] for t in texts]
+    texts = [clean(t)[:1000] for t in texts]
     idx = [i for i, t in enumerate(texts) if len(t) >= 40]  # tiny posts carry no topic
     if len(idx) < min_posts:
         return []
     vecs = embed([texts[i] for i in idx])
+    keep = dedupe(vecs)
+    idx = [idx[k] for k in keep]
+    vecs = vecs[keep]
+    if len(idx) < min_posts:
+        return []
     groups = [g for g in cluster(vecs) if len(g) >= min_posts]
     groups.sort(key=len, reverse=True)
     out: list[NewTopic] = []
     taken = {n.lower() for n in existing_names}
     for g in groups:
-        if len(out) >= max_new:
+        if sum(1 for t in out if not t.merge_into) >= max_new:
             break
         centre = vecs[g].mean(axis=0)
         centre /= np.linalg.norm(centre) + 1e-12
         if float((vecs[g] @ centre).mean()) < MIN_COHESION:
             continue  # a loose mix of unrelated posts, not a topic
-        if existing_vectors is not None and len(existing_vectors):
-            if float((existing_vectors @ centre).max()) >= EXISTING_TOPIC_SIM:
-                continue
         members = [idx[k] for k in g]
         sample = [texts[i] for i in members]
-        keywords = extract_keywords(sample, [texts[i] for i in idx])
+        tpl = template_words(sample)
+        keywords = [w for w in extract_keywords(sample, [texts[i] for i in idx], limit=10) if w not in tpl][:5]
+        if existing_vectors is not None and len(existing_vectors):
+            sims = existing_vectors @ centre
+            best = int(sims.argmax())
+            if float(sims[best]) >= EXISTING_TOPIC_SIM:
+                # same subject as a topic that missed these posts: teach it the group's
+                # words (when vectors map 1:1 to topics) instead of dropping the group
+                if len(existing_vectors) == len(existing_names) and keywords:
+                    out.append(NewTopic(name=existing_names[best], keywords=keywords[:4],
+                                        members=members, merge_into=existing_names[best]))
+                continue
+        if len(keywords) < 2:
+            continue  # nothing left once the template is removed: an ad series, not a topic
         name = ""
         if namer is not None:
             try:
